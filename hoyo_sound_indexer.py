@@ -2391,6 +2391,7 @@ def run_gui():
         return QIcon(pm)
 
     USER_ROLE = Qt.ItemDataRole.UserRole
+    _MAX_ID_LOOKUPS = 100
 
     def load_config():
         try:
@@ -3351,8 +3352,23 @@ def run_gui():
 
         # ---------- tree
 
+        # Every wem and bnk id as text, so the search box can match a piece of a number.
+        # Built once per scan: on Zenless it is 288k ids and a query costs 36 ms.
+        def _build_id_index(self):
+            self._wems_by_bnk = defaultdict(set)
+            self._id_strings = []
+            if self.index is None:
+                return
+            wem_ids = set(self.index.wem_locations) | set(self.index.external_locations)
+            for wid in wem_ids:
+                for loc in locations_for(self.index, wid):
+                    if loc.bnk_id:
+                        self._wems_by_bnk[loc.bnk_id].add(wid)
+            self._id_strings = [(str(i), i) for i in wem_ids | set(self._wems_by_bnk)]
+
         def populate_tree(self):
             # Pre-lowercased names: the filter does not recompute them on every keystroke.
+            self._build_id_index()
             self._names_lower = [m.name.lower() for m in self.matches]
             self._match_buckets = [bucket_of_kind(m.kind) for m in self.matches]
             self._match_langs = [self._lang_of(m) for m in self.matches]
@@ -3415,21 +3431,34 @@ def run_gui():
             return self.active_bucket
 
         # Rebuilding beats hiding rows one by one: 0.1s vs 1.4s on 111k rows.
-        def rebuild_tree(self, matches, lookup_id=None):
+        def rebuild_tree(self, matches, lookup_ids=None):
             _t0 = time.time()
             self.tree.setUpdatesEnabled(False)
             self._lookup_item = None
             self.tree.clear()
             items = []
-            if lookup_id is not None and self.index is not None:
-                locs = locations_for(self.index, lookup_id)
+            for lid in (lookup_ids or []):
+                if self.index is None:
+                    break
+                locs = locations_for(self.index, lid)
                 if locs:
-                    item = QTreeWidgetItem(["(direct wem id lookup)", "WEM", str(lookup_id), "", ""])
+                    item = QTreeWidgetItem([f"(wem {lid})", "WEM", str(lid), "", f"{len(locs)} loc"])
                     for loc in locs:
-                        child = QTreeWidgetItem([loc.label(), "wem", str(lookup_id), loc.lang, f"{loc.size:,}"])
+                        child = QTreeWidgetItem([loc.label(), "wem", str(lid), loc.lang, f"{loc.size:,}"])
                         child.setData(0, USER_ROLE, loc)
                         item.addChild(child)
-                    items.append(item)
+                elif lid in self._wems_by_bnk:
+                    wems = sorted(self._wems_by_bnk[lid])
+                    item = QTreeWidgetItem([f"(bnk {lid})", "BNK", str(lid), "", f"{len(wems)} wems"])
+                    for wid in wems[:_MAX_ID_LOOKUPS]:
+                        for loc in locations_for(self.index, wid):
+                            child = QTreeWidgetItem([loc.label(), "wem", str(wid), loc.lang, f"{loc.size:,}"])
+                            child.setData(0, USER_ROLE, loc)
+                            item.addChild(child)
+                else:
+                    continue
+                items.append(item)
+                if self._lookup_item is None:
                     self._lookup_item = item
             for m in matches:
                 size_col = f"{len(m.wem_ids)} wems" if m.wem_ids else ""
@@ -3482,6 +3511,7 @@ def run_gui():
         def apply_filter(self):
             text = self.filter_edit.text().strip().lower()
             as_id = int(text) if text.isdigit() else None
+            id_hits = {i for s, i in self._id_strings if text in s} if text.isdigit() else set()
             bucket = self._active_bucket()
             wanted_langs = {name for name, check in self.lang_checks.items() if check.isChecked()}
             audio_only = self.audio_only_chk.isChecked()
@@ -3498,12 +3528,15 @@ def run_gui():
                 if text:
                     if text in self._names_lower[i]:
                         pass
-                    elif as_id is not None and (as_id == match.hash_id or as_id in match.wem_ids):
+                    elif as_id is not None and text in str(match.hash_id):
+                        pass
+                    elif id_hits and not id_hits.isdisjoint(match.wem_ids):
                         pass
                     else:
                         continue
                 subset.append(match)
-            self.rebuild_tree(subset, lookup_id=as_id)
+            lookup = sorted(id_hits)[:_MAX_ID_LOOKUPS] if id_hits else []
+            self.rebuild_tree(subset, lookup_ids=lookup)
             if len(subset) != len(self.matches):
                 self.status_lbl.setText(f"{len(subset):,} of {len(self.matches):,} results shown")
 
