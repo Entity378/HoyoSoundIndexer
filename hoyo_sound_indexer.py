@@ -933,8 +933,15 @@ def _rel_path(path, root):
         return str(path)
 
 
-def _wem_entry(wid, index, root):
+# A wem id often lives twice: a short prefetch inside the bnk and the full file in a streamed pck.
+# The biggest one comes first so previews and playback never get the 0.1s stub.
+def locations_for(index, wid):
     locs = index.wem_locations.get(wid, []) + index.external_locations.get(wid, [])
+    return sorted(locs, key=lambda l: l.size, reverse=True)
+
+
+def _wem_entry(wid, index, root):
+    locs = locations_for(index, wid)
     return {
         "languages": sorted({l.lang for l in locs}),
         "sources": [{
@@ -2139,7 +2146,7 @@ def run_cli(args):
         for m in matches[: args.sample]:
             locs = []
             for w in m.wem_ids[:4]:
-                ll = index.wem_locations.get(w) or index.external_locations.get(w)
+                ll = locations_for(index, w)
                 locs.append(f"{w}@{ll[0].label()}" if ll else f"{w}@?")
             print(f"    [{m.kind}] {m.name} -> {len(m.wem_ids)} wem  {locs}")
 
@@ -3415,8 +3422,7 @@ def run_gui():
             self.tree.clear()
             items = []
             if lookup_id is not None and self.index is not None:
-                locs = (self.index.wem_locations.get(lookup_id, [])
-                        + self.index.external_locations.get(lookup_id, []))
+                locs = locations_for(self.index, lookup_id)
                 if locs:
                     item = QTreeWidgetItem(["(direct wem id lookup)", "WEM", str(lookup_id), "", ""])
                     for loc in locs:
@@ -3455,8 +3461,7 @@ def run_gui():
                 return
             item.takeChildren()
             for wid in m.wem_ids[:500]:
-                locs = (self.index.wem_locations.get(wid, [])
-                        + self.index.external_locations.get(wid, []))
+                locs = locations_for(self.index, wid)
                 if not locs:
                     child = QTreeWidgetItem(["(not found in pcks)", "wem", str(wid), "", ""])
                     item.addChild(child)
