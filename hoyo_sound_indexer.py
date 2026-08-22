@@ -1446,7 +1446,7 @@ def extract_wem_bytes(loc):
         return f.read(loc.size)
 
 
-def wem_to_wav(wem_bytes, vgmstream, out_dir, stem="wnf_current"):
+def wem_to_wav(wem_bytes, vgmstream, out_dir, stem="hsi_current"):
     wem_path = Path(out_dir) / f"{stem}.wem"
     wav_path = Path(out_dir) / f"{stem}.wav"
     wem_path.write_bytes(wem_bytes)
@@ -2550,7 +2550,7 @@ def run_gui():
             self.convert_worker = None
             self.vgm_worker = None
             self.vgmstream = find_vgmstream()
-            self.temp_dir = tempfile.mkdtemp(prefix="wemnamefinder_")
+            self.temp_dir = tempfile.mkdtemp(prefix="hoyosoundindexer_")
             self.player = QMediaPlayer(self)
             self.audio_out = QAudioOutput(self)
             self.audio_out.setVolume(int(self.cfg.get("volume", 80)) / 100)
@@ -3311,6 +3311,10 @@ def run_gui():
                 if m and m.wem_ids:
                     self.filter_edit.setText(str(m.wem_ids[0]))
                     self.apply_filter()
+                    # apply_filter rebuilds the tree, so the item grabbed above is already destroyed.
+                    item = self.tree.topLevelItem(0)
+                    if item is None:
+                        break
                     self.tree.expandItem(item)
                     if item.childCount():
                         child = item.child(0)
@@ -3552,7 +3556,7 @@ def run_gui():
             self._pending_loc = loc
             self._play_seq = getattr(self, "_play_seq", 0) + 1
             self.convert_worker = ConvertWorker(loc, self.vgmstream, self.temp_dir,
-                                                f"wnf_{self._play_seq}")
+                                                f"hsi_{self._play_seq}")
             self.convert_worker.done.connect(self.on_wav_ready)
             self.convert_worker.failed.connect(lambda e: self.play_lbl.setText(f"Error: {e}"))
             self.convert_worker.start()
