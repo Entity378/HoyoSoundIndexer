@@ -26,13 +26,15 @@ from shutil import which
 import certifi
 from blkdec import iter_blk_blocks, oodle_available
 from PyQt6.QtCore import QPoint, QRectF, Qt, QThread, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPixmap
+from PyQt6.QtGui import (
+    QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPainterPath, QPixmap,
+)
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
     QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
     QRadioButton, QSlider, QStyle, QTabWidget, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget,
 )
@@ -952,6 +954,17 @@ def _wem_entry(wid, index, root):
             "size": l.size,
         } for l in locs],
     }
+
+
+# Event names become file names: separators, reserved characters and the .wem tail go away.
+def safe_file_stem(text, limit=80):
+    text = str(text).strip()
+    if text.lower().endswith(".wem"):
+        text = text[:-4]
+    text = re.sub(r"[\\/]+", "_", text)
+    text = re.sub(r'[<>:"|?*\x00-\x1f]+', "_", text)
+    text = text.strip(" ._")
+    return text[:limit] or "wem"
 
 
 def export_txt(matches, out_path):
@@ -2518,6 +2531,46 @@ def run_gui():
             except Exception as e:
                 self.failed.emit(str(e))
 
+    # Batch export: hundreds of wems are hundreds of reads, so it stays off the GUI thread.
+    class ExportWorker(QThread):
+        progressed = pyqtSignal(int, int, str)
+        done = pyqtSignal(int, int, str)
+        failed = pyqtSignal(str)
+
+        def __init__(self, jobs, out_dir):
+            super().__init__()
+            self.jobs = jobs
+            self.out_dir = out_dir
+            self._cancel = False
+
+        def cancel(self):
+            self._cancel = True
+
+        def run(self):
+            try:
+                out = Path(self.out_dir)
+                out.mkdir(parents=True, exist_ok=True)
+                written, skipped, used = 0, 0, set()
+                total = len(self.jobs)
+                for i, (stem, loc) in enumerate(self.jobs):
+                    if self._cancel:
+                        break
+                    # Two locations of the same wem (bnk stub + streamed file) share the stem.
+                    name, n = stem, 2
+                    while name.lower() in used:
+                        name, n = f"{stem}_{n}", n + 1
+                    used.add(name.lower())
+                    try:
+                        (out / f"{name}.wem").write_bytes(extract_wem_bytes(loc))
+                        written += 1
+                    except Exception:
+                        skipped += 1
+                    if i % 8 == 0 or i == total - 1:
+                        self.progressed.emit(i + 1, total, f"Exporting {i + 1:,} of {total:,}...")
+                self.done.emit(written, skipped, str(out))
+            except Exception as e:
+                self.failed.emit(str(e))
+
     class VgmstreamWorker(QThread):
         progressed = pyqtSignal(int, int, str)
         done = pyqtSignal(str)
@@ -2556,6 +2609,7 @@ def run_gui():
             self.worker = None
             self.harvest_worker = None
             self.convert_worker = None
+            self.export_worker = None
             self.vgm_worker = None
             self.vgmstream = find_vgmstream()
             self.temp_dir = tempfile.mkdtemp(prefix="hoyosoundindexer_")
@@ -2662,6 +2716,15 @@ def run_gui():
             self.tree.itemExpanded.connect(self.fill_children)
             self.tree.itemSelectionChanged.connect(self.update_buttons)
             self.tree.itemDoubleClicked.connect(lambda *_: self.play_selected())
+            # Multi selection: ctrl/shift click to export or copy many rows at once.
+            self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+            self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self.tree.customContextMenuRequested.connect(self.on_tree_menu)
+            copy_act = QAction("Copy IDs", self.tree)
+            copy_act.setShortcut(QKeySequence.StandardKey.Copy)
+            copy_act.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+            copy_act.triggered.connect(self.copy_ids)
+            self.tree.addAction(copy_act)
             right.addWidget(self.tree, 1)
             body.addLayout(right, 1)
             layout.addLayout(body, 1)
@@ -2703,9 +2766,19 @@ def run_gui():
             self.stop_btn.setEnabled(False)
             row5.addWidget(self.stop_btn)
             self.export_btn = QPushButton("Export WEM...")
+            self.export_btn.setToolTip(
+                "Export the selected wems (ctrl/shift click selects more than one;\n"
+                "selecting an event exports every wem it uses)")
             self.export_btn.clicked.connect(self.export_selected)
             self.export_btn.setEnabled(False)
             row5.addWidget(self.export_btn)
+            self.copy_btn = QPushButton("Copy IDs")
+            self.copy_btn.setToolTip(
+                "Copy the ID of the selected rows (Ctrl+C).\n"
+                "Right click on the tree for the other copy options.")
+            self.copy_btn.clicked.connect(self.copy_ids)
+            self.copy_btn.setEnabled(False)
+            row5.addWidget(self.copy_btn)
             self.export_names_btn = QPushButton("Export names...")
             self.export_names_btn.clicked.connect(self.export_names)
             self.export_names_btn.setEnabled(False)
@@ -3541,17 +3614,159 @@ def run_gui():
                 self.status_lbl.setText(f"{len(subset):,} of {len(self.matches):,} results shown")
 
         def selected_location(self):
-            items = self.tree.selectedItems()
-            if not items:
-                return None
-            data = items[0].data(0, USER_ROLE)
-            return data if isinstance(data, WemLocation) else None
+            # Playback takes the first wem of the selection: the other rows may be events.
+            for item in self.tree.selectedItems():
+                data = item.data(0, USER_ROLE)
+                if isinstance(data, WemLocation):
+                    return data
+            return None
+
+        # The location rows of an item never expanded ("..." placeholder) do not exist yet.
+        @staticmethod
+        def _child_locations(item):
+            for i in range(item.childCount()):
+                child = item.child(i)
+                data = child.data(0, USER_ROLE)
+                if isinstance(data, WemLocation):
+                    yield child, data
+
+        # Cheap upper bound for the button label: it never touches the index.
+        def _selected_export_count(self):
+            total = 0
+            for item in self.tree.selectedItems():
+                data = item.data(0, USER_ROLE)
+                if isinstance(data, WemLocation):
+                    total += 1
+                elif isinstance(data, NameMatch):
+                    total += len(data.wem_ids)
+                else:
+                    total += sum(1 for _ in self._child_locations(item))
+            return total
+
+        # A wem row exports that exact location, an event the best location of each of its wems.
+        def _selected_export_jobs(self):
+            if self.index is None:
+                return []
+            jobs, seen = [], set()
+
+            def add_loc(stem, loc):
+                key = (stem, loc.pck_path, loc.offset, loc.size)
+                if key in seen:
+                    return
+                seen.add(key)
+                jobs.append((stem, loc))
+
+            def add_wem(wid, prefix):
+                locs = locations_for(self.index, wid)
+                if locs:
+                    add_loc(f"{prefix}{wid}", locs[0])
+
+            for item in self.tree.selectedItems():
+                data = item.data(0, USER_ROLE)
+                if isinstance(data, WemLocation):
+                    add_loc(item.text(2) or "wem", data)
+                elif isinstance(data, NameMatch):
+                    prefix = f"{safe_file_stem(data.name)}_" if data.name else ""
+                    for wid in data.wem_ids:
+                        add_wem(wid, prefix)
+                else:
+                    for child, loc in self._child_locations(item):
+                        add_loc(child.text(2) or "wem", loc)
+            return jobs
 
         def update_buttons(self):
             loc = self.selected_location()
+            count = self._selected_export_count()
             playing = self.player.playbackState() != QMediaPlayer.PlaybackState.StoppedState
             self.play_btn.setEnabled(loc is not None or playing)
-            self.export_btn.setEnabled(loc is not None)
+            busy = bool(self.export_worker and self.export_worker.isRunning())
+            self.export_btn.setEnabled(count > 0 and not busy)
+            self.export_btn.setText("Export WEM..." if count < 2 else f"Export {count:,} WEM...")
+            self.copy_btn.setEnabled(bool(self.tree.selectedItems()))
+
+        # ---------- copy
+
+        def _copy_lines(self, values, label):
+            lines = list(dict.fromkeys(v for v in values if v))
+            if not lines:
+                self.play_lbl.setText(f"No {label} in the selection")
+                return
+            QApplication.clipboard().setText("\n".join(lines))
+            plural = "" if len(lines) == 1 else "s"
+            self.play_lbl.setText(f"Copied {len(lines):,} {label}{plural}")
+
+        # Whatever sits in the ID column: event, bank, wem or external hash.
+        def copy_ids(self):
+            self._copy_lines([i.text(2) for i in self.tree.selectedItems()], "ID")
+
+        def copy_wem_ids(self):
+            out = []
+            for item in self.tree.selectedItems():
+                data = item.data(0, USER_ROLE)
+                if isinstance(data, WemLocation):
+                    out.append(item.text(2))
+                elif isinstance(data, NameMatch):
+                    out.extend(str(w) for w in data.wem_ids)
+                else:
+                    if item.text(1) == "WEM":
+                        out.append(item.text(2))
+                    out.extend(child.text(2) for child, _ in self._child_locations(item))
+            self._copy_lines(out, "wem id")
+
+        def copy_bnk_ids(self):
+            out = []
+            for item in self.tree.selectedItems():
+                data = item.data(0, USER_ROLE)
+                if isinstance(data, WemLocation):
+                    out.append(str(data.bnk_id or ""))
+                elif isinstance(data, NameMatch):
+                    if data.kind == "Bank":
+                        out.append(str(data.hash_id))
+                    if self.index is not None:
+                        for wid in data.wem_ids:
+                            out.extend(str(l.bnk_id) for l in locations_for(self.index, wid)
+                                       if l.bnk_id)
+                elif item.text(1) == "BNK":
+                    out.append(item.text(2))
+            self._copy_lines(out, "bnk id")
+
+        def copy_names(self):
+            out = []
+            for item in self.tree.selectedItems():
+                data = item.data(0, USER_ROLE)
+                out.append(data.name if isinstance(data, NameMatch) else item.text(0))
+            self._copy_lines(out, "name")
+
+        # Tab separated: it pastes straight into a spreadsheet.
+        def copy_rows(self):
+            columns = range(self.tree.columnCount())
+            rows = ["\t".join(item.text(c) for c in columns)
+                    for item in self.tree.selectedItems()]
+            self._copy_lines(rows, "row")
+
+        def on_tree_menu(self, pos):
+            item = self.tree.itemAt(pos)
+            if item is not None and not item.isSelected():
+                self.tree.setCurrentItem(item)
+            if not self.tree.selectedItems():
+                return
+            count = self._selected_export_count()
+            menu = QMenu(self)
+            play = menu.addAction("Play")
+            play.setEnabled(self.selected_location() is not None)
+            play.triggered.connect(self.play_selected)
+            export = menu.addAction("Export WEM..." if count < 2 else f"Export {count:,} WEM...")
+            export.setEnabled(self.export_btn.isEnabled())
+            export.triggered.connect(self.export_selected)
+            menu.addSeparator()
+            copy = menu.addAction("Copy ID")
+            copy.setShortcut(QKeySequence.StandardKey.Copy)
+            copy.triggered.connect(self.copy_ids)
+            menu.addAction("Copy WEM IDs").triggered.connect(self.copy_wem_ids)
+            menu.addAction("Copy BNK IDs").triggered.connect(self.copy_bnk_ids)
+            menu.addAction("Copy name").triggered.connect(self.copy_names)
+            menu.addAction("Copy row (tab separated)").triggered.connect(self.copy_rows)
+            menu.exec(self.tree.viewport().mapToGlobal(pos))
 
         # ---------- playback / export
 
@@ -3634,20 +3849,64 @@ def run_gui():
             self.vol_lbl.setText(f"{value}%")
             self.cfg["volume"] = value
 
+        # One wem: save dialog, as before. More than one: pick a folder and write in background.
         def export_selected(self):
-            loc = self.selected_location()
-            if not loc:
+            if self.export_worker and self.export_worker.isRunning():
                 return
-            items = self.tree.selectedItems()
-            wid = items[0].text(2)
-            out, _ = QFileDialog.getSaveFileName(self, "Export WEM", f"{wid}.wem", "WEM (*.wem)")
-            if not out:
+            jobs = self._selected_export_jobs()
+            if not jobs:
                 return
-            try:
-                Path(out).write_bytes(extract_wem_bytes(loc))
-                self.play_lbl.setText(f"Exported {Path(out).name}")
-            except Exception as e:
-                QMessageBox.warning(self, APP_NAME, f"Export failed: {e}")
+            if len(jobs) == 1:
+                stem, loc = jobs[0]
+                out, _ = QFileDialog.getSaveFileName(
+                    self, "Export WEM", f"{stem}.wem", "WEM (*.wem)")
+                if not out:
+                    return
+                try:
+                    Path(out).write_bytes(extract_wem_bytes(loc))
+                    self.play_lbl.setText(f"Exported {Path(out).name}")
+                except Exception as e:
+                    QMessageBox.warning(self, APP_NAME, f"Export failed: {e}")
+                return
+            if len(jobs) > 500:
+                answer = QMessageBox.question(
+                    self, APP_NAME,
+                    f"Export {len(jobs):,} wem files?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes)
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+            folder = QFileDialog.getExistingDirectory(
+                self, f"Export {len(jobs):,} WEM files to folder",
+                self.cfg.get("export_dir", "") or self.folder_edit.text().strip())
+            if not folder:
+                return
+            self.cfg["export_dir"] = folder
+            self.export_btn.setEnabled(False)
+            self.progress.setRange(0, len(jobs))
+            self.progress.setValue(0)
+            self.progress.setVisible(True)
+            self.export_worker = ExportWorker(jobs, folder)
+            self.export_worker.progressed.connect(self.on_export_progress)
+            self.export_worker.done.connect(self.on_export_done)
+            self.export_worker.failed.connect(self.on_export_failed)
+            self.export_worker.start()
+
+        def on_export_progress(self, cur, total, msg):
+            self.progress.setRange(0, total)
+            self.progress.setValue(cur)
+            self.play_lbl.setText(msg)
+
+        def on_export_done(self, written, skipped, folder):
+            self.progress.setVisible(False)
+            tail = f", {skipped:,} failed" if skipped else ""
+            self.play_lbl.setText(f"Exported {written:,} wems to {Path(folder).name}{tail}")
+            self.update_buttons()
+
+        def on_export_failed(self, message):
+            self.progress.setVisible(False)
+            self.update_buttons()
+            QMessageBox.warning(self, APP_NAME, f"Export failed: {message}")
 
         def export_names(self):
             if not self.matches:
@@ -3686,6 +3945,9 @@ def run_gui():
             if self.harvest_worker and self.harvest_worker.isRunning():
                 self.harvest_worker.cancel()
                 self.harvest_worker.wait(3000)
+            if self.export_worker and self.export_worker.isRunning():
+                self.export_worker.cancel()
+                self.export_worker.wait(3000)
             super().closeEvent(event)
 
     # With the light title bar the window clashes with the rest.
