@@ -4,6 +4,7 @@
 import argparse
 import ctypes
 import io
+import itertools
 import json
 import multiprocessing
 import os
@@ -531,6 +532,7 @@ class ScanIndex:
         self.parents = defaultdict(set)
         self.object_ids = set()
         self.sync_ids = {}
+        self.action_syncs = {}
         self.named_objects = {}
         self.music_trees = {}
         self.stats = defaultdict(int)
@@ -765,9 +767,13 @@ def scan_folder(root, progress=None, cancel=None):
                     act = parse_action(raw, p, end)
                     if act:
                         index.actions.setdefault(oid, act)
+                        touched = []
                         for sync_id, kind in parse_action_syncs(raw, p, end, act[0], act[1]):
                             if sync_id:
                                 index.sync_ids.setdefault(sync_id, kind)
+                                touched.append(sync_id)
+                        if touched:
+                            index.action_syncs.setdefault(oid, touched)
                 elif otype == HIRC_SOUND:
                     sound_parse = parse_sound(raw, p, end)
                     if sound_parse:
@@ -1008,6 +1014,230 @@ def music_branch_matches(index, matches):
            for label, (target, wems) in rows.items()]
     out.sort(key=lambda m: m.name.lower())
     return out
+
+
+def _fnv32_feed(data, state=0x811C9DC5):
+    for b in data:
+        state = (state * 0x01000193) & 0xFFFFFFFF
+        state ^= b
+    return state
+
+
+_TAG_PREFIXES = ("State_", "StateGroup_", "BGM_", "Music_", "Switch_", "SwitchGroup_")
+
+
+# Unnamed sync ids get three extra passes: known prefixes glued to every candidate,
+# family slots refilled across the named syncs, and known stems with tail suffixes.
+# Names like BGM_Combat or SwitchGroup_C29_03 exist only as code-side concatenations.
+def crack_sync_names(index, candidates, matches):
+    matched_ids = {m.hash_id for m in matches}
+    wanted = {sid for sid in index.sync_ids if sid not in matched_ids}
+    if not wanted:
+        return []
+    found = {}
+
+    def take(name, h):
+        if h in wanted and h not in found:
+            found[h] = name
+
+    prefix_states = [(prefix, _fnv32_feed(prefix.lower().encode())) for prefix in _TAG_PREFIXES]
+    for candidate in candidates:
+        tail = candidate.lower().encode()
+        for prefix, state in prefix_states:
+            take(prefix + candidate, _fnv32_feed(tail, state))
+
+    sync_names = {m.name for m in matches if m.hash_id in index.sync_ids} | set(found.values())
+    templates = defaultdict(set)
+    for name in sync_names:
+        tokens = name.lower().split("_")
+        if 2 <= len(tokens) <= 10:
+            for i, token in enumerate(tokens):
+                if token:
+                    templates[("_".join(tokens[:i]), "_".join(tokens[i + 1:]))].add(token)
+    fillers = set()
+    for members in templates.values():
+        if len(members) >= 3:
+            fillers |= members
+    for (prefix, suffix), members in templates.items():
+        for filler in fillers - members:
+            name = "_".join(part for part in (prefix, filler, suffix) if part)
+            take(name, fnv1_32(name))
+
+    tails = ("yes", "no", "on", "off", "true", "false", "a", "b", "c", "start", "end",
+             "in", "out", "normal", "none", "good", "bad", "perfect") \
+            + tuple(f"{n:02d}" for n in range(31)) + tuple(str(n) for n in range(11))
+    for stem in list(sync_names | set(found.values())):
+        for tail_word in tails:
+            name = f"{stem}_{tail_word}"
+            take(name, fnv1_32(name))
+    return [NameMatch(name, index.sync_ids.get(h, "State"), [], h) for h, name in found.items()]
+
+
+# Matched event names crack their missing family members: the varying token is refilled
+# with every filler already seen on the same prefix, and verified by hash as always.
+def crack_event_families(index, matches, progress=None):
+    known = {m.hash_id: m.name for m in matches if m.kind in ("Event", "DialogueEvent")}
+    unresolved = (set(index.event_actions) | set(index.dialogue_children)) - set(known)
+    if not unresolved or not known:
+        return []
+    out = []
+    for _round in range(2):
+        names = set(known.values()) | {m.name for m in out}
+        templates = defaultdict(set)
+        for name in names:
+            tokens = name.lower().split("_")
+            if not 2 <= len(tokens) <= 12:
+                continue
+            for i, token in enumerate(tokens):
+                if token and len(token) <= 24:
+                    templates[("_".join(tokens[:i]), "_".join(tokens[i + 1:]))].add(token)
+        for template in KNOWN_EVENT_TEMPLATES:
+            head, _slot, tail = template.partition("{}")
+            templates.setdefault((head.strip("_"), tail.strip("_")), set())
+        fillers_by_prefix = defaultdict(set)
+        for (prefix, _suffix), fillers in templates.items():
+            if len(fillers) >= 4:
+                fillers_by_prefix[prefix] |= fillers
+        done = 0
+        for (prefix, suffix), fillers in templates.items():
+            done += 1
+            candidates = fillers_by_prefix.get(prefix)
+            if not candidates or len(candidates) > 6000 or prefix.count("_") < 1:
+                continue
+            head_state = _fnv32_feed((prefix + "_").encode()) if prefix else 0x811C9DC5
+            tail = ("_" + suffix).encode() if suffix else b""
+            for filler in candidates:
+                if filler in fillers:
+                    continue
+                h = _fnv32_feed(filler.encode() + tail, head_state)
+                if h in unresolved:
+                    unresolved.discard(h)
+                    full = "_".join(part for part in (prefix, filler, suffix) if part)
+                    kind = "Event" if h in index.event_actions else "DialogueEvent"
+                    out.append(NameMatch(full, kind, sorted(index.wems_for_event(h)), h))
+            if progress and done % 2000 == 0:
+                progress(done, len(templates), f"Cracking event families ({len(out)} found)...")
+    return out
+
+
+# Last pass on the still unnamed syncs: the vocabulary of whatever touches each tag
+# (its events, its group mates, its tree siblings) recombined into 1-2 word candidates.
+def crack_context_names(index, matches):
+    name_of = {m.hash_id: m.name for m in matches}
+    wanted = {sid for sid in index.sync_ids if sid not in name_of}
+    if not wanted:
+        return []
+    events_of = defaultdict(set)
+    pair_of = defaultdict(set)
+    action_events = defaultdict(set)
+    for eid, action_ids in index.event_actions.items():
+        for aid in action_ids:
+            action_events[aid].add(eid)
+    for aid, sync_ids in index.action_syncs.items():
+        for sid in sync_ids:
+            events_of[sid] |= action_events.get(aid, set())
+            pair_of[sid].update(x for x in sync_ids if x != sid)
+    tree_siblings = defaultdict(set)
+    for groups, _group_types, leaves in index.music_trees.values():
+        members = {g for g in groups if g}
+        for keys, _target in leaves:
+            members.update(k for k in keys if k)
+        for member in members:
+            tree_siblings[member] |= members - {member}
+    global_tokens = Counter(t for n in name_of.values() for t in n.lower().split("_")
+                            if 2 <= len(t) <= 12)
+    top_global = [t for t, _c in global_tokens.most_common(500)]
+    skip_tokens = ("play", "stop", "mute", "pause", "resume", "set")
+
+    out = []
+    for _round in range(2):
+        for match in out:
+            name_of.setdefault(match.hash_id, match.name)
+        wanted -= {match.hash_id for match in out}
+        for sid in list(wanted):
+            context_names = [name_of[eid] for eid in events_of.get(sid, ()) if eid in name_of]
+            related = pair_of.get(sid, set()) | tree_siblings.get(sid, set())
+            # Two hops reach the sibling values of the same group.
+            for rel in list(related):
+                related |= pair_of.get(rel, set())
+            context_names += [name_of[rel] for rel in related if rel != sid and rel in name_of]
+            if not context_names:
+                continue
+            ctx = []
+            for name in context_names:
+                for token in name.lower().split("_"):
+                    if 2 <= len(token) <= 14 and token not in skip_tokens and token not in ctx:
+                        ctx.append(token)
+            ctx = ctx[:25]
+
+            def candidates():
+                # Many groups are named exactly like a touching event minus its verb prefix.
+                for name in context_names:
+                    low = name.lower()
+                    for verb in ("play_", "set_state_", "set_", "stop_", "mute_"):
+                        if low.startswith(verb):
+                            low = low[len(verb):]
+                            break
+                    tokens = low.split("_")
+                    for start in range(len(tokens)):
+                        for stop in range(start + 1, len(tokens) + 1):
+                            yield "_".join(tokens[start:stop])
+                # Sibling names ending in one half of a pair suggest the other half.
+                for name in context_names:
+                    low = name.lower()
+                    for half_a, half_b in (("start", "end"), ("open", "close"), ("on", "off"),
+                                           ("in", "out"), ("good", "bad"), ("yes", "no"),
+                                           ("enter", "exit"), ("first", "last")):
+                        if low.endswith("_" + half_a) or low == half_a:
+                            yield low[: -len(half_a)] + half_b if "_" in low else half_b
+                        if low.endswith("_" + half_b) or low == half_b:
+                            yield low[: -len(half_b)] + half_a if "_" in low else half_a
+                yield from ctx
+                for a, b in itertools.permutations(ctx, 2):
+                    yield a + "_" + b
+                    yield a + b
+                for a, b, c in itertools.permutations(ctx[:14], 3):
+                    yield a + "_" + b + "_" + c
+                    yield a + b + c
+                    yield a + "_" + b + c
+                for a in ctx[:12]:
+                    for g in top_global:
+                        yield a + "_" + g
+                        yield g + "_" + a
+                        yield a + g
+
+            for candidate in candidates():
+                if fnv1_32(candidate) == sid:
+                    out.append(NameMatch(candidate, index.sync_ids.get(sid, "State"), [], sid))
+                    break
+    return out
+
+
+# The state/switch tag rows get the wems their key selects in the music trees.
+# Searching "Cottus" then lands on a playable row, not on an empty sync entry.
+def attach_music_tag_wems(index, matches):
+    trees = index.music_trees
+    if not trees:
+        return
+    inv = index.inv or {}
+    wems_by_key = defaultdict(set)
+    for groups, _group_types, leaves in trees.values():
+        tree_wems = set()
+        for keys, target in leaves:
+            if not target:
+                continue
+            wems = set(inv.get(target, ())) | set(index.node_srcs.get(target, ()))
+            tree_wems |= wems
+            for key in keys:
+                if key:
+                    wems_by_key[key] |= wems
+        for group_id in groups:
+            if group_id:
+                wems_by_key[group_id] |= tree_wems
+    for m in matches:
+        if (not m.wem_ids and m.hash_id in wems_by_key
+                and m.kind in ("State", "Switch", "State group", "Switch group")):
+            m.wem_ids = sorted(wems_by_key[m.hash_id])
 
 
 # Rebuilds the matches of an export from the saved id, not from the name hash.
@@ -2293,20 +2523,38 @@ def resolve_online_voices(game, voice_paths, external_ids, progress=None):
 
 # ---------------------------------------------------------------- name resolution pipeline
 
+# Knowledge that exists in no harvestable data, reverse engineered by hand.
+# Templates: the {} slot is refilled by crack_event_families with every known family filler.
+KNOWN_EVENT_TEMPLATES = ("play_vo_char_{}_charconfirm",)
+# Sync names the game code composes at runtime, recovered one by one by hand.
+KNOWN_SYNC_NAMES = ("vo_charconfirm", "vo_charconfirm_yes", "vo_charconfirm_no",
+                    "shot1", "shot2", "state_crazytime", "farfromboss_state", "qte_state")
+
+
 # The whole naming pass shared by CLI and GUI, deduped at the end.
 # Names file, local state harvest, exported matches, online voices and labels, music branch rows.
 def resolve_all_matches(index, names, scan_root, names_path=None, vo_data=None,
-                        progress=None, cancel=None):
+                        progress=None, cancel=None, crack=True):
     counts = {}
     matches, unmatched = match_names(names, index, progress=progress) if names else ([], [])
-    state_names = harvest_local_state_names(scan_root, progress=progress, cancel=cancel)
-    counts["local_state_candidates"] = len(state_names)
-    online_candidates = (vo_data or {}).get("state_candidates") or []
-    if online_candidates:
-        state_names = sorted(set(state_names) | set(online_candidates))
+    # With crack off, the harvest and every cracker are skipped: an export loaded as
+    # names file restores the same names by id, so scans get their ~45s back.
+    if crack:
+        state_names = harvest_local_state_names(scan_root, progress=progress, cancel=cancel)
+        counts["local_state_candidates"] = len(state_names)
+        online_candidates = (vo_data or {}).get("state_candidates") or []
+        state_names = sorted(set(state_names) | set(online_candidates) | set(KNOWN_SYNC_NAMES))
+    else:
+        state_names = sorted(KNOWN_SYNC_NAMES)
     if state_names and not (cancel and cancel()):
         state_matches, _ = match_names(state_names, index, progress=progress)
         matches.extend(state_matches)
+        if crack:
+            if progress:
+                progress(0, 1, "Cracking unnamed tags...")
+            cracked = crack_sync_names(index, state_names, matches)
+            matches.extend(cracked)
+            counts["cracked_tags"] = len(cracked)
     matches = apply_exported_matches(names_path, index, matches)
     if vo_data and index.external_locations:
         if vo_data.get("online"):
@@ -2325,9 +2573,19 @@ def resolve_all_matches(index, names, scan_root, names_path=None, vo_data=None,
         for label_name, category, oid, wems in labels:
             matches.append(NameMatch(label_name, category, wems, oid))
         counts["labels"] = len(labels)
+    if crack:
+        family_matches = crack_event_families(index, matches, progress=progress)
+        matches.extend(family_matches)
+        counts["family_events"] = len(family_matches)
+        if progress:
+            progress(0, 1, "Cracking tags from context...")
+        context_cracked = crack_context_names(index, matches)
+        matches.extend(context_cracked)
+        counts["context_tags"] = len(context_cracked)
     branches = music_branch_matches(index, matches)
     matches.extend(branches)
     counts["music_branches"] = len(branches)
+    attach_music_tag_wems(index, matches)
     matches = dedupe_matches(matches)
     return matches, prune_unmatched(matches, unmatched), counts
 
@@ -2409,7 +2667,8 @@ def run_cli(args):
     print(f"  events with >=1 resolved wem: {linked}/{len(index.event_actions)}")
 
     matches, unmatched, counts = resolve_all_matches(
-        index, names, args.scan, names_path=args.names, vo_data=vo_data, progress=prog)
+        index, names, args.scan, names_path=args.names, vo_data=vo_data, progress=prog,
+        crack=not args.no_crack)
     if counts.get("local_state_candidates"):
         print(f"\n  local state candidates: {counts['local_state_candidates']} (ZZZ data blocks)")
     if "voices" in counts:
@@ -2711,12 +2970,13 @@ def run_gui():
         finished_ok = pyqtSignal(object, object, object)
         failed = pyqtSignal(str)
 
-        def __init__(self, folder, names, vo_data=None, names_path=""):
+        def __init__(self, folder, names, vo_data=None, names_path="", crack=True):
             super().__init__()
             self.folder = folder
             self.names = names
             self.names_path = names_path
             self.vo_data = vo_data
+            self.crack = crack
             self._cancel = False
 
         def cancel(self):
@@ -2732,7 +2992,7 @@ def run_gui():
                 matches, unmatched, _counts = resolve_all_matches(
                     index, self.names, self.folder, names_path=self.names_path,
                     vo_data=self.vo_data, progress=self.progressed.emit,
-                    cancel=lambda: self._cancel)
+                    cancel=lambda: self._cancel, crack=self.crack)
                 self.finished_ok.emit(index, matches, unmatched)
             except Exception as e:
                 self.failed.emit(str(e))
@@ -2922,6 +3182,13 @@ def run_gui():
             browse_btn = QPushButton("Browse...")
             browse_btn.clicked.connect(self.pick_folder)
             row1.addWidget(browse_btn)
+            self.crack_chk = QCheckBox("Crack")
+            self.crack_chk.setChecked(bool(self.cfg.get("crack", True)))
+            self.crack_chk.setToolTip(
+                "Deep name cracking (~45s per scan): harvest, tags, event families, context.\n"
+                "Run it once, save with Export names..., load that JSON as Names file,\n"
+                "then untick to get the same names back instantly on every scan.")
+            row1.addWidget(self.crack_chk)
             self.scan_btn = QPushButton("Scan")
             self.scan_btn.setDefault(True)
             self.scan_btn.clicked.connect(self.start_scan)
@@ -3601,14 +3868,16 @@ def run_gui():
             folders = dict(self.cfg.get("folders") or {})
             folders[self.current_game()] = folder
             self.cfg.update({"names": self.names_path, "folder": folder,
-                             "game": self.current_game(), "folders": folders})
+                             "game": self.current_game(), "folders": folders,
+                             "crack": self.crack_chk.isChecked()})
             save_config(self.cfg)
             self.scan_root = folder
             self.tree.clear()
             self.export_names_btn.setEnabled(False)
             self.scan_btn.setText("Cancel")
             self.worker = ScanWorker(folder, names, vo_data,
-                                     self.names_path if self.file_chk.isChecked() else "")
+                                     self.names_path if self.file_chk.isChecked() else "",
+                                     crack=self.crack_chk.isChecked())
             self.worker.progressed.connect(self.on_progress)
             self.worker.finished_ok.connect(self.on_scan_done)
             self.worker.failed.connect(self.on_scan_failed)
@@ -4277,6 +4546,7 @@ def main():
     parser.add_argument("--vo-online", choices=["GI", "SR", "ZZZ"], help="download & use online voice-name data (Dimbreath repos) for this game")
     parser.add_argument("--vo-online-refresh", action="store_true", help="force re-download of the online voice data (ignore the local cache)")
     parser.add_argument("--harvest-game", choices=["ZZZ", "GI", "SR"], help="decrypt .blk asset bundles for this game (Blocks folder) instead of raw scanning")
+    parser.add_argument("--no-crack", action="store_true", help="skip the deep name cracking (use a saved export as --names instead)")
     args = parser.parse_args()
     if args.scan or args.harvest or args.vo_online:
         run_cli(args)
