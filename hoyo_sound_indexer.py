@@ -1,5 +1,5 @@
 # Matches names (txt/json/harvest/online) against the Wwise content of a folder: FNV-32 events resolved down to wems, FNV-64 externals.
-# GUI: python hoyo_sound_indexer.py | CLI: --scan <folder> --names <txt>
+# GUI: python hoyo_sound_indexer.py | CLI: --scan <folder> --names <txt>.
 
 import argparse
 import ctypes
@@ -18,7 +18,7 @@ import time
 import urllib.request
 import zipfile
 from collections import Counter, defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from shutil import which
@@ -99,9 +99,9 @@ ACTION_TRIGGER = 29
 CONTAINER_TYPES = {HIRC_RANSEQ, HIRC_SWITCH, HIRC_ACTORMIXER, HIRC_LAYER}
 MUSIC_NODE_TYPES = {HIRC_MUSIC_SEGMENT, HIRC_MUSIC_SWITCH, HIRC_MUSIC_RANSEQ}
 
-# pluginID(4) + streamType(1) + sourceID(4) + mediaSize(4) + sourceBits(1)
+# pluginID(4) + streamType(1) + sourceID(4) + mediaSize(4) + sourceBits(1).
 SOURCE_DATA_SIZE = 14
-# trackID(4) + sourceID(4) + eventID(4) + 4 doubles
+# trackID(4) + sourceID(4) + eventID(4) + 4 doubles.
 TRACK_SRC_INFO_SIZE = 44
 
 ACTION_TYPE_NAMES = {
@@ -148,12 +148,12 @@ class WemLocation:
         self.kind = kind
 
     def label(self):
-        src = Path(self.pck_path).name
+        text = Path(self.pck_path).name
         if "persistent" in self.pck_path.lower():
-            src = "Persistent/" + src
+            text = "Persistent/" + text
         if self.kind == "bnk":
-            src += f" > bnk {self.bnk_id}"
-        return src
+            text += f" > bnk {self.bnk_id}"
+        return text
 
 
 def parse_pck(pck_path):
@@ -164,24 +164,24 @@ def parse_pck(pck_path):
         if f.read(4) != b"AKPK":
             raise ValueError("not AKPK")
         header_size = struct.unpack("<I", f.read(4))[0]
-        # version/flags
+        # The skipped u32 is version/flags.
         f.read(4)
-        sec1 = struct.unpack("<I", f.read(4))[0]
-        sec2 = struct.unpack("<I", f.read(4))[0]
-        sec3 = struct.unpack("<I", f.read(4))[0]
-        if sec1 + sec2 + sec3 + 0x10 < header_size:
-            sec4 = struct.unpack("<I", f.read(4))[0]
+        lang_size = struct.unpack("<I", f.read(4))[0]
+        banks_size = struct.unpack("<I", f.read(4))[0]
+        sounds_size = struct.unpack("<I", f.read(4))[0]
+        if lang_size + banks_size + sounds_size + 0x10 < header_size:
+            externals_size = struct.unpack("<I", f.read(4))[0]
         else:
-            sec4 = 0
+            externals_size = 0
 
         strings_offset = f.tell()
-        if sec1 > 0:
+        if lang_size > 0:
             lang_count = struct.unpack("<I", f.read(4))[0]
-            defs = []
+            lang_defs = []
             for _ in range(lang_count):
-                off, lid = struct.unpack("<II", f.read(8))
-                defs.append((lid, strings_offset + off))
-            for lid, off in defs:
+                off, lang_id = struct.unpack("<II", f.read(8))
+                lang_defs.append((lang_id, strings_offset + off))
+            for lang_id, off in lang_defs:
                 pos = f.tell()
                 f.seek(off)
                 name = ""
@@ -194,9 +194,9 @@ def parse_pck(pck_path):
                     except Exception:
                         break
                 if name:
-                    lang_map[lid] = name.lower()
+                    lang_map[lang_id] = name.lower()
                 f.seek(pos)
-        f.seek(strings_offset + sec1)
+        f.seek(strings_offset + lang_size)
 
         def read_table(section_size, wide_id):
             out = []
@@ -205,17 +205,17 @@ def parse_pck(pck_path):
             count = struct.unpack("<I", f.read(4))[0]
             for _ in range(count):
                 if wide_id:
-                    fid = struct.unpack("<Q", f.read(8))[0]
+                    file_id = struct.unpack("<Q", f.read(8))[0]
                 else:
-                    fid = struct.unpack("<I", f.read(4))[0]
+                    file_id = struct.unpack("<I", f.read(4))[0]
                 blocksize, size, offset_block, lang_id = struct.unpack("<IIII", f.read(16))
                 offset = offset_block * blocksize if blocksize else offset_block
-                out.append({"id": fid, "offset": offset, "size": size, "lang_id": lang_id})
+                out.append({"id": file_id, "offset": offset, "size": size, "lang_id": lang_id})
             return out
 
-        banks = read_table(sec2, False)
-        sounds = read_table(sec3, False)
-        externals = read_table(sec4, True) if sec4 > 0 else []
+        banks = read_table(banks_size, False)
+        sounds = read_table(sounds_size, False)
+        externals = read_table(externals_size, True) if externals_size > 0 else []
 
     return lang_map, banks, sounds, externals
 
@@ -230,10 +230,10 @@ class BnkMeta:
         self.lang = "?"
         self.version = 0
         self.bkhd_id = 0
-        # absolute offset in the file
+        # Absolute offset in the file.
         self.hirc_offset = 0
         self.hirc_size = 0
-        # (wem_id, abs_offset, size)
+        # Tuples of (wem_id, abs_offset, size).
         self.didx_wems = []
 
 
@@ -248,16 +248,16 @@ def scan_bnk_chunks(f, base_offset, size, meta):
         if len(head) < 8:
             break
         tag = head[:4]
-        clen = struct.unpack("<I", head[4:])[0]
+        chunk_size = struct.unpack("<I", head[4:])[0]
         payload = pos + 8
-        if payload + clen > end + 16:
+        if payload + chunk_size > end + 16:
             break
         if tag == b"BKHD":
-            hdr = f.read(min(12, clen))
-            if len(hdr) >= 12:
-                meta.version, meta.bkhd_id, _lang = struct.unpack("<III", hdr)
+            header = f.read(min(12, chunk_size))
+            if len(header) >= 12:
+                meta.version, meta.bkhd_id, _lang = struct.unpack("<III", header)
         elif tag == b"DIDX":
-            raw = f.read(clen)
+            raw = f.read(chunk_size)
             for i in range(len(raw) // 12):
                 wid, off, wsize = struct.unpack_from("<III", raw, i * 12)
                 didx.append((wid, off, wsize))
@@ -265,8 +265,8 @@ def scan_bnk_chunks(f, base_offset, size, meta):
             data_payload = payload
         elif tag == b"HIRC":
             meta.hirc_offset = payload
-            meta.hirc_size = clen
-        pos = payload + clen
+            meta.hirc_size = chunk_size
+        pos = payload + chunk_size
     if data_payload is not None:
         for wid, off, wsize in didx:
             meta.didx_wems.append((wid, data_payload + off, wsize))
@@ -298,7 +298,7 @@ def iter_hirc_objects(raw):
 def parse_event_actions(raw, p, end):
     if p >= end:
         return []
-    # 7-bit varint
+    # 7-bit varint count first.
     q = p
     cnt = 0
     shift = 0
@@ -313,7 +313,7 @@ def parse_event_actions(raw, p, end):
         shift += 7
     if ok and q + cnt * 4 == end and cnt < 1000:
         return list(struct.unpack_from(f"<{cnt}I", raw, q)) if cnt else []
-    # u32 count
+    # Plain u32 count otherwise.
     if p + 4 <= end:
         cnt = struct.unpack_from("<I", raw, p)[0]
         if p + 4 + cnt * 4 == end and cnt < 1000:
@@ -343,12 +343,12 @@ def parse_action_syncs(raw, p, end, atype, target):
     if q >= end:
         return []
     num_props = raw[q]
-    # id(1) + value(4) per property
+    # id(1) + value(4) per property.
     q += 1 + num_props * 5
     if q >= end:
         return []
     num_mods = raw[q]
-    # id(1) + min/max(8) per modifier
+    # id(1) + min/max(8) per modifier.
     q += 1 + num_mods * 9
     if q + 8 > end:
         return []
@@ -365,7 +365,7 @@ def parse_sound(raw, p, end):
     plugin = struct.unpack_from("<I", raw, p)[0]
     src_id = struct.unpack_from("<I", raw, p + 5)[0]
     q = p + SOURCE_DATA_SIZE
-    # source plugin: uSize + params
+    # A source plugin carries uSize + params.
     if plugin & 0xF == 2:
         if q + 4 > end:
             return src_id, None
@@ -422,7 +422,7 @@ def parse_music_track(raw, p, end, variant):
     srcs.discard(0)
     parent = None
     try:
-        # numSubTrack
+        # Skips numSubTrack.
         q += 4
         num_clip = struct.unpack_from("<I", raw, q)[0]
         q += 4
@@ -435,7 +435,7 @@ def parse_music_track(raw, p, end, variant):
             if npt > 10000:
                 raise ValueError
             q += 12 * npt
-        # eTrackType(4) + bIsTransitionEnabled(1)
+        # eTrackType(4) + bIsTransitionEnabled(1).
         q += 5
         parent = parse_parent(raw, q, end, variant)
     except Exception:
@@ -472,50 +472,47 @@ def _decode_music_tree(tree, depth):
 
     def visit(idx, level, path):
         key, union = nodes[idx][0], nodes[idx][1]
-        cidx, ccount = union & 0xFFFF, union >> 16
+        child_idx, child_count = union & 0xFFFF, union >> 16
         # Children must sit forward in the array; anything else is an audio-node leaf.
-        if level >= depth or ccount == 0 or ccount > 128 or cidx <= idx or cidx + ccount > count:
+        if level >= depth or child_count == 0 or child_count > 128 or child_idx <= idx or child_idx + child_count > count:
             leaves.append((tuple(path + [key]), union))
             return
-        for k in range(ccount):
-            visit(cidx + k, level + 1, path + [key])
+        for k in range(child_count):
+            visit(child_idx + k, level + 1, path + [key])
 
     root_union = nodes[0][1]
-    root_cidx, root_count = root_union & 0xFFFF, root_union >> 16
-    if not root_count or root_cidx + root_count > count:
+    root_child_idx, root_child_count = root_union & 0xFFFF, root_union >> 16
+    if not root_child_count or root_child_idx + root_child_count > count:
         return None
-    for k in range(root_count):
-        visit(root_cidx + k, 1, [])
+    for k in range(root_child_count):
+        visit(root_child_idx + k, 1, [])
     return leaves
 
 
-# MusicSwitchCntr branch data sits at the tail of the object:
-# [continuePlayback u8][treeDepth u32][groupID u32 * depth][groupType u8 * depth]
-# [treeSize u32][mode u8][nodes 12B: key, audioNodeID | (childIdx u16, childCount u16), weight, prob].
-# The front (NodeBaseParams + transition rules) shifts across Wwise versions, so the tail
-# is located by scanning candidate sizes and validating depth and leaf targets.
+# The MusicSwitchCntr tail is [continue u8][depth u32][groups u32*d][types u8*d][treeSize u32][mode u8][nodes 12B].
+# The front shifts across Wwise versions, so the tail is found by probing sizes and validating depth and leaf targets.
 def parse_music_switch_tree(raw, p, end, object_ids):
     for tree_size in range(12, end - p - 9, 12):
-        x = end - tree_size - 5
-        if x - 9 < p:
+        size_offset = end - tree_size - 5
+        if size_offset - 9 < p:
             break
-        if struct.unpack_from("<I", raw, x)[0] != tree_size:
+        if struct.unpack_from("<I", raw, size_offset)[0] != tree_size:
             continue
         for depth in range(1, 9):
-            dep_off = x - 5 * depth - 4
-            if dep_off < p:
+            depth_offset = size_offset - 5 * depth - 4
+            if depth_offset < p:
                 break
-            if struct.unpack_from("<I", raw, dep_off)[0] != depth:
+            if struct.unpack_from("<I", raw, depth_offset)[0] != depth:
                 continue
-            groups = struct.unpack_from(f"<{depth}I", raw, dep_off + 4)
-            gtypes = tuple(raw[dep_off + 4 + 4 * depth: dep_off + 4 + 5 * depth])
-            leaves = _decode_music_tree(raw[x + 5: x + 5 + tree_size], depth)
+            groups = struct.unpack_from(f"<{depth}I", raw, depth_offset + 4)
+            group_types = tuple(raw[depth_offset + 4 + 4 * depth: depth_offset + 4 + 5 * depth])
+            leaves = _decode_music_tree(raw[size_offset + 5: size_offset + 5 + tree_size], depth)
             if not leaves:
                 continue
-            good = sum(1 for _, t in leaves if t == 0 or t in object_ids)
+            good = sum(1 for _, target in leaves if target == 0 or target in object_ids)
             if good < len(leaves) * 0.7:
                 continue
-            return groups, gtypes, leaves
+            return groups, group_types, leaves
     return None
 
 
@@ -583,7 +580,7 @@ def calibrate_variant(samples, object_ids, kind):
         good = total = 0
         for raw, p, end in samples:
             if kind == "music":
-                # MusicParameter flags byte
+                # Skips the MusicParameter flags byte.
                 p = p + 1
             parent = parse_parent(raw, p, end, variant)
             if parent is None:
@@ -772,25 +769,25 @@ def scan_folder(root, progress=None, cancel=None):
                             if sync_id:
                                 index.sync_ids.setdefault(sync_id, kind)
                 elif otype == HIRC_SOUND:
-                    r = parse_sound(raw, p, end)
-                    if r:
-                        src_id, bp = r
+                    sound_parse = parse_sound(raw, p, end)
+                    if sound_parse:
+                        src_id, params_offset = sound_parse
                         if src_id:
                             index.node_srcs[oid].add(src_id)
-                        if bp is not None:
-                            parent = parse_parent(raw, bp, end, cont_variant)
+                        if params_offset is not None:
+                            parent = parse_parent(raw, params_offset, end, cont_variant)
                             if parent and parent in index.object_ids:
                                 index.parents[oid].add(parent)
                 elif otype == HIRC_MUSIC_TRACK:
-                    r = parse_music_track(raw, p, end, "flat2")
-                    if r and not (r[1] and r[1] in index.object_ids):
+                    track_parse = parse_music_track(raw, p, end, "flat2")
+                    if track_parse and not (track_parse[1] and track_parse[1] in index.object_ids):
                         for variant in ("bus7", "bus6"):
-                            r2 = parse_music_track(raw, p, end, variant)
-                            if r2 and r2[1] and r2[1] in index.object_ids:
-                                r = r2
+                            retry_parse = parse_music_track(raw, p, end, variant)
+                            if retry_parse and retry_parse[1] and retry_parse[1] in index.object_ids:
+                                track_parse = retry_parse
                                 break
-                    if r:
-                        srcs, parent = r
+                    if track_parse:
+                        srcs, parent = track_parse
                         if srcs:
                             index.node_srcs[oid] |= srcs
                         if parent and parent in index.object_ids:
@@ -823,14 +820,14 @@ def scan_folder(root, progress=None, cancel=None):
             progress(i + 1, len(hirc_metas), "Parsing HIRC (2/2)...")
 
     # Group/value ids of the music trees become matchable syncs, so state names attach to them.
-    for groups, gtypes, leaves in index.music_trees.values():
-        for gid, gt in zip(groups, gtypes):
-            if gid:
-                index.sync_ids.setdefault(gid, "Switch group" if gt == 0 else "State group")
+    for groups, group_types, leaves in index.music_trees.values():
+        for group_id, group_type in zip(groups, group_types):
+            if group_id:
+                index.sync_ids.setdefault(group_id, "Switch group" if group_type == 0 else "State group")
         for keys, _target in leaves:
-            for gt, key in zip(gtypes, keys):
+            for group_type, key in zip(group_types, keys):
                 if key:
-                    index.sync_ids.setdefault(key, "Switch" if gt == 0 else "State")
+                    index.sync_ids.setdefault(key, "Switch" if group_type == 0 else "State")
 
     index.stats["pck"] = len(pck_files)
     index.stats["bnk_inline"] = len(bnk_metas)
@@ -951,22 +948,22 @@ def _wems_for_object(index, oid):
 MUSIC_BRANCH_KIND = "Music branch"
 
 
-# One row per music-switch leaf whose state path got at least one name back
-# (e.g. "Stage_Combat_Boss / Cottus" for the boss theme wems). Nested switches
-# compose their paths, so the label reads outermost to innermost.
+# One row per music-switch leaf whose state path got at least one name back, like "Stage_Combat_Boss / Cottus".
+# Nested switches compose their paths, so the label reads outermost to innermost.
 def music_branch_matches(index, matches):
     trees = index.music_trees
     if not trees:
         return []
     needed = set()
-    for _groups, _gtypes, leaves in trees.values():
+    for _groups, _group_types, leaves in trees.values():
         for keys, _target in leaves:
             needed.update(k for k in keys if k)
     key_names = {m.hash_id: m.name for m in matches if m.hash_id in needed}
     if not key_names:
         return []
     inv = index.inv or {}
-    per_target = {}  # leaf target -> [label, resolved_count, wems]
+    # Each leaf target maps to [label, resolved_count, wems].
+    per_target = {}
 
     def expand(oid, prefix, seen):
         for keys, target in trees[oid][2]:
@@ -974,9 +971,12 @@ def music_branch_matches(index, matches):
             if target in trees and target not in seen:
                 expand(target, path, seen | {target})
             elif target:
-                # "None" is the default state: it names nothing, it only pads the path.
-                resolved = [key_names[k] for k in path
-                            if k in key_names and key_names[k].lower() != "none"]
+                # Default/boolean states only pad the path: dropped unless nothing else names the branch.
+                resolved = [key_names[k] for k in path if k in key_names]
+                cleaned = [n for n in resolved
+                           if n.lower() not in ("none", "false", "true",
+                                                "state_false", "state_true")]
+                resolved = cleaned or resolved
                 if not resolved:
                     continue
                 wems = set(inv.get(target, ())) | set(index.node_srcs.get(target, ()))
@@ -992,7 +992,7 @@ def music_branch_matches(index, matches):
                         row[0], row[1] = label, len(resolved)
                     row[2] |= wems
 
-    leaf_targets = {t for _g, _gt, leaves in trees.values() for _keys, t in leaves}
+    leaf_targets = {target for _g, _gt, leaves in trees.values() for _keys, target in leaves}
     for oid in trees:
         if oid not in leaf_targets:
             expand(oid, [], {oid})
@@ -1177,9 +1177,9 @@ def default_harvest_prefixes(game):
     return HARVEST_PREFIXES_BY_GAME.get(game, DEFAULT_HARVEST_PREFIXES)
 
 
-# 16 MB per read: constant RAM per worker
+# 16 MB per read keeps the RAM per worker constant.
 _HARVEST_CHUNK = 1 << 24
-# covers names straddling two chunks
+# The overlap covers names straddling two chunks.
 _HARVEST_OVERLAP = 256
 
 
@@ -1242,7 +1242,7 @@ def _harvest_blk(path, pat, game):
         prefixes |= pre
         sources |= src
     if not seen_any:
-        # unknown container: the caller falls back to the raw scan
+        # On an unknown container the caller falls back to the raw scan.
         return None
     return names, prefixes, sources
 
@@ -1251,11 +1251,10 @@ def _harvest_file(path, prefixes, game=None):
     pat = _harvest_pattern(prefixes)
     if game and (path.lower().endswith(".blk") or path.lower().endswith(".block")):
         try:
-            res = _harvest_blk(path, pat, game)
-            if res is not None:
-                return res
+            blk_result = _harvest_blk(path, pat, game)
+            if blk_result is not None:
+                return blk_result
         except Exception:
-            # fall back to raw scan below
             pass
     found = set()
     try:
@@ -1274,8 +1273,8 @@ def _harvest_file(path, prefixes, game=None):
     return found, set(), set()
 
 
-# ZZZ keeps its config tables (chapters, bosses, scenes, jukebox) in a handful of
-# small data blocks: their strings are the candidate pool that names the music states.
+# ZZZ keeps its config tables in a handful of small data blocks.
+# Their strings are the candidate pool that names the music states.
 ZZZ_DATA_BLOCK_DIRS = (
     ("ZenlessZoneZero_Data", "Persistent", "Blocks", "Data"),
     ("Persistent", "Blocks", "Data"),
@@ -1283,25 +1282,49 @@ ZZZ_DATA_BLOCK_DIRS = (
 _STATE_NAME_RE = re.compile(rb"[A-Za-z][A-Za-z0-9_]{2,79}")
 
 
+# il2cpp metadata carries the C# string literals, plaintext on ZZZ.
+# Boss/state names set from code appear there and in no config table.
+def _metadata_files(root):
+    dirs = [root / "il2cpp_data" / "Metadata"]
+    try:
+        dirs += [d / "il2cpp_data" / "Metadata"
+                 for d in root.iterdir() if d.is_dir() and d.name.endswith("_Data")]
+    except Exception:
+        pass
+    files = []
+    for d in dirs:
+        if d.is_dir():
+            files += sorted(d.glob("*.dat"))
+    return files
+
+
 def harvest_local_state_names(scan_root, progress=None, cancel=None):
-    base = None
-    for parts in ZZZ_DATA_BLOCK_DIRS:
-        cand = Path(scan_root).joinpath(*parts)
-        if cand.is_dir():
-            base = cand
-            break
-    if base is None:
-        return []
-    files = sorted(base.glob("*.blk"))
+    root = Path(scan_root)
     seen = set()
-    for i, blk in enumerate(files):
+    data_blocks_dir = None
+    for parts in ZZZ_DATA_BLOCK_DIRS:
+        candidate = root.joinpath(*parts)
+        if candidate.is_dir():
+            data_blocks_dir = candidate
+            break
+    blk_files = sorted(data_blocks_dir.glob("*.blk")) if data_blocks_dir else []
+    for i, blk in enumerate(blk_files):
         if cancel and cancel():
             break
         if progress:
-            progress(i, len(files), f"Reading data blocks for state names ({len(seen)})...")
+            progress(i, len(blk_files), f"Reading data blocks for state names ({len(seen)})...")
         try:
             for block in iter_blk_blocks(str(blk), "ZZZ"):
                 seen.update(m.group() for m in _STATE_NAME_RE.finditer(block))
+        except Exception:
+            continue
+    for dat in _metadata_files(root):
+        if cancel and cancel():
+            break
+        if progress:
+            progress(0, 1, f"Reading {dat.name} for state names ({len(seen)})...")
+        try:
+            seen.update(m.group() for m in _STATE_NAME_RE.finditer(dat.read_bytes()))
         except Exception:
             continue
     names = []
@@ -1310,8 +1333,8 @@ def harvest_local_state_names(scan_root, progress=None, cancel=None):
             names.append(s.decode("ascii"))
         except UnicodeDecodeError:
             pass
-    if progress:
-        progress(len(files), len(files) or 1, f"State candidates: {len(names)}")
+    if progress and (blk_files or names):
+        progress(1, 1, f"State candidates: {len(names)}")
     return sorted(names)
 
 
@@ -1373,7 +1396,7 @@ VO_SUFFIXES = ("", "_m", "_f")
 
 
 def vo_head_candidates(languages=VO_LANGUAGE_CANDIDATES):
-    # some games omit the language
+    # Some games omit the language.
     heads = [""]
     for lang in languages:
         heads.extend([f"{lang}/Ex/", f"{lang}\\", f"{lang}/", f"{lang}/voice/"])
@@ -1433,25 +1456,25 @@ def parse_vo_prefix(prefix):
 
 def _vo_candidate_paths(source, by_category, by_speaker, max_candidates):
     leaf_low = source.lower()
-    # already a path
+    # The source may already be a full path.
     if "/" in leaf_low or "\\" in leaf_low:
         return [leaf_low]
     paths = []
     category = _vo_category_of(leaf_low)
     pool = by_category.get(category) if category else None
     if pool:
-        named = [pre for pre, spk in pool if spk and spk in leaf_low]
-        paths = named or ([pre for pre, _ in pool] if len(pool) <= max_candidates else [])
+        named = [prefix for prefix, speaker in pool if speaker and speaker in leaf_low]
+        paths = named or ([prefix for prefix, _ in pool] if len(pool) <= max_candidates else [])
     if not paths:
         for speaker, entries in by_speaker.items():
             if speaker and speaker in leaf_low:
-                paths.extend(pre for pre, _ in entries)
+                paths.extend(prefix for prefix, _ in entries)
                 if len(paths) >= max_candidates:
                     break
     out = []
-    for pre in paths[:max_candidates]:
-        sep = "\\" if "\\" in pre else "/"
-        out.append(pre.rstrip("/\\") + sep + leaf_low)
+    for prefix in paths[:max_candidates]:
+        sep = "\\" if "\\" in prefix else "/"
+        out.append(prefix.rstrip("/\\") + sep + leaf_low)
     return out
 
 
@@ -1553,9 +1576,9 @@ def crack_vo_names(prefixes, sources, external_ids, heads=None, progress=None,
                 state = head_states.get(head)
                 if state is None:
                     continue
-                h = _fnv64_feed(_vo_tail(path, suffix), state)
-                if h in external_ids and h not in resolved:
-                    resolved[h] = (path + suffix, vo_language_of_head(head))
+                hashed = _fnv64_feed(_vo_tail(path, suffix), state)
+                if hashed in external_ids and hashed not in resolved:
+                    resolved[hashed] = (path + suffix, vo_language_of_head(head))
         if progress and i % 2000 == 0:
             progress(i, total, f"Recovering voice names ({len(resolved)} found)")
     if progress:
@@ -1679,8 +1702,7 @@ VOICE_SOURCES = {
         "music_cfg": "FileCfg/MusicPlayerConfigTemplateTb.json",
         "textmap": "TextMap/TextMap_ENTemplateTb.json",
         "textmap_overwrite": "TextMap/TextMap_ENOverwriteTemplateTb.json",
-        # The extra tables carry readable Play_* events (custom/default/scene sounds)
-        # and the state names of the BGM music switches (BigSceneBGM & co.).
+        # The extra tables carry readable Play_* events and the state names of the BGM switches.
         "event_cfg_files": ["FileCfg/AudioEventTemplateTb.json",
                             "FileCfg/CustomSoundEventTemplateTb.json",
                             "FileCfg/DefaultSoundEventTemplateTb.json",
@@ -1688,6 +1710,8 @@ VOICE_SOURCES = {
                             "FileCfg/BigSceneBGMTemplateTb.json",
                             "FileCfg/SmithyMusicConfigTemplateTb.json",
                             "FileCfg/MainCityBGMConfigTemplateTb.json"],
+        # Every other table is raw-scanned for state/switch name candidates.
+        "cfg_scan_dir": "FileCfg",
     },
     "SR": {
         "label": "Star Rail - Dimbreath/turnbasedgamedata",
@@ -1832,11 +1856,11 @@ def _extract_voicepaths(data):
     doc = json.loads(data.decode("utf-8", "ignore"))
     items = doc if isinstance(doc, list) else list(doc.values())
     out = []
-    for it in items:
-        if isinstance(it, dict):
-            vp = it.get("VoicePath")
-            if isinstance(vp, str) and vp:
-                out.append(vp)
+    for item in items:
+        if isinstance(item, dict):
+            voice_path = item.get("VoicePath")
+            if isinstance(voice_path, str) and voice_path:
+                out.append(voice_path)
     return out
 
 
@@ -1859,13 +1883,13 @@ _AUDIO_NAME_RE = re.compile(r"^[A-Za-z][\w]{2,}$")
 # id->name pairs are the only handle for objects whose id is not the hash of the name (MusicSegment and friends).
 def _collect_audio_meta(node, names, id_names, category):
     if isinstance(node, dict):
-        strs = [v for v in node.values() if isinstance(v, str) and _AUDIO_NAME_RE.match(v)]
-        ints = [v for v in node.values() if isinstance(v, int) and v > 0xFFFF]
+        str_values = [v for v in node.values() if isinstance(v, str) and _AUDIO_NAME_RE.match(v)]
+        int_values = [v for v in node.values() if isinstance(v, int) and v > 0xFFFF]
         for v in node.values():
             if isinstance(v, str) and _AUDIO_NAME_RE.match(v):
                 names.add(v)
-        if len(strs) == 1 and len(ints) == 1:
-            id_names[str(ints[0])] = [strs[0], category]
+        if len(str_values) == 1 and len(int_values) == 1:
+            id_names[str(int_values[0])] = [str_values[0], category]
         for v in node.values():
             _collect_audio_meta(v, names, id_names, category)
     elif isinstance(node, list):
@@ -1914,6 +1938,48 @@ def _scan_targz_names(blob, pattern, progress=None):
 def _gitea_raw(source, relative_path):
     host = source.get("host", "https://git.mero.moe")
     return _http_get(f"{host}/{source['project']}/raw/branch/{source['ref']}/{relative_path}")
+
+
+def _gitea_list_dir(source, dirpath):
+    host = source.get("host", "https://git.mero.moe")
+    data = _http_get(f"{host}/api/v1/repos/{source['project']}/contents/{dirpath}?ref={source['ref']}")
+    entries = json.loads(data.decode("utf-8", "ignore"))
+    return [e["name"] for e in entries if isinstance(e, dict) and e.get("type") == "file"]
+
+
+# Raw identifier scan of every table in the cfg dir, for the state names the curated tables miss.
+# Matching keeps only real hits, so the obfuscated field names that come along do no harm.
+def _fetch_cfg_candidates(src, progress=None):
+    dirpath = src.get("cfg_scan_dir")
+    if not dirpath:
+        return []
+    try:
+        files = _gitea_list_dir(src, dirpath)
+    except Exception:
+        return []
+    pattern = re.compile(rb"[A-Za-z][A-Za-z0-9_]{2,79}")
+    seen = set()
+
+    def fetch(name):
+        try:
+            return _gitea_raw(src, f"{dirpath}/{name}")
+        except Exception:
+            return b""
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for done, blob in enumerate(pool.map(fetch, files), 1):
+            if blob:
+                seen.update(m.group() for m in pattern.finditer(blob))
+            if progress and done % 25 == 0:
+                progress(done, len(files),
+                         f"Downloading config tables ({done}/{len(files)}, {len(seen)} candidates)")
+    out = []
+    for s in seen:
+        try:
+            out.append(s.decode("ascii"))
+        except UnicodeDecodeError:
+            pass
+    return sorted(out)
 
 
 _WWISE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,}$")
@@ -1974,17 +2040,17 @@ def _fetch_audio_meta(src, progress=None):
     names, id_names = set(), {}
     # ZZZ: track titles from the music player config (gitea), no gitlab archive.
     if src.get("music_cfg"):
-        n, ids = _fetch_zzz_music_meta(src, progress)
-        names.update(n)
-        id_names.update(ids)
+        zzz_names, zzz_ids = _fetch_zzz_music_meta(src, progress)
+        names.update(zzz_names)
+        id_names.update(zzz_ids)
     # GI: json subtree -> hash-attachable names + id->name tables (MusicSegment).
     if src.get("audio_subtree"):
         if progress:
             progress(0, 1, "Downloading audio metadata...")
-        n, ids = _extract_audio_meta_from_targz(
+        gi_names, gi_ids = _extract_audio_meta_from_targz(
             _gitlab_archive(src, src["audio_subtree"]), src["audio_subtree"], progress)
-        names.update(n)
-        id_names.update(ids)
+        names.update(gi_names)
+        id_names.update(gi_ids)
     # SR: event names (Ev_...) from targeted tables and subtrees, raw scan.
     if src.get("event_files") or src.get("event_subtrees"):
         pattern = _event_name_pattern(src.get("event_prefixes", "Ev,Play,Stop"))
@@ -2018,11 +2084,13 @@ def download_online_data(game, progress=None, config=None, force=False):
             pass
     voice_paths = sorted(set(_fetch_voice_paths(game, src, progress)))
     names, id_names = _fetch_audio_meta(src, progress)
+    state_candidates = _fetch_cfg_candidates(src, progress)
     meta = {"game": game, "label": src.get("label", ""),
             "updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "voice_count": len(voice_paths), "names_count": len(names),
-            "labels_count": len(id_names),
-            "voice_paths": voice_paths, "names": names, "id_names": id_names}
+            "labels_count": len(id_names), "candidates_count": len(state_candidates),
+            "voice_paths": voice_paths, "names": names, "id_names": id_names,
+            "state_candidates": state_candidates}
     cache.parent.mkdir(parents=True, exist_ok=True)
     cache.write_text(json.dumps(meta), encoding="utf-8")
     return meta
@@ -2131,8 +2199,8 @@ def extrapolate_voice_names(live, voice_paths, external_ids, resolved, progress=
     budget = _MAX_EXTRAPOLATED_CANDIDATES
     steps = len(live) * (len(speaker_prefixes) + len(families))
     done = 0
-    for head, lang, uses, state in live:
-        suffixes = ("", "_m", "_f") if uses else ("",)
+    for head, lang, uses_mf, state in live:
+        suffixes = ("", "_m", "_f") if uses_mf else ("",)
         pattern_tails = [(_vo_tail(pattern, suffix).decode(), _vo_tail(pattern.lower(), suffix))
                          for pattern in patterns for suffix in suffixes]
         take_tails = {}
@@ -2189,31 +2257,31 @@ def resolve_online_voices(game, voice_paths, external_ids, progress=None):
     external_ids = set(external_ids)
     paths = [p for p in voice_paths if p]
     heads = _online_heads(game, VO_ONLINE_LANGS.get(game, VO_ONLINE_LANGS["GI"]))
-    head_states = {h: _fnv64_feed(h.lower().encode()) for h, _, _ in heads}
-    suf_for = lambda uses: ("", "_m", "_f") if uses else ("",)
+    head_states = {head: _fnv64_feed(head.lower().encode()) for head, _, _ in heads}
+    suffixes_for = lambda uses_mf: ("", "_m", "_f") if uses_mf else ("",)
 
     step = max(1, len(paths) // 4000)
     sample = paths[::step][:4000]
     live = []
-    for head, lang, uses in heads:
-        st = head_states[head]
-        for p in sample:
-            pl = p.lower()
-            if any(_fnv64_feed(_vo_tail(pl, suf), st) in external_ids for suf in suf_for(uses)):
-                live.append((head, lang, uses, st))
+    for head, lang, uses_mf in heads:
+        state = head_states[head]
+        for path in sample:
+            path_low = path.lower()
+            if any(_fnv64_feed(_vo_tail(path_low, suffix), state) in external_ids for suffix in suffixes_for(uses_mf)):
+                live.append((head, lang, uses_mf, state))
                 break
     if not live:
-        live = [(h, l, u, head_states[h]) for h, l, u in heads]
+        live = [(head, lang, uses_mf, head_states[head]) for head, lang, uses_mf in heads]
 
     resolved = {}
     total = len(paths)
     for i, path in enumerate(paths):
-        pl = path.lower()
-        for head, lang, uses, st in live:
-            for suf in suf_for(uses):
-                h = _fnv64_feed(_vo_tail(pl, suf), st)
-                if h in external_ids and h not in resolved:
-                    resolved[h] = (head + _vo_tail(path, suf).decode(), lang)
+        path_low = path.lower()
+        for head, lang, uses_mf, state in live:
+            for suffix in suffixes_for(uses_mf):
+                hashed = _fnv64_feed(_vo_tail(path_low, suffix), state)
+                if hashed in external_ids and hashed not in resolved:
+                    resolved[hashed] = (head + _vo_tail(path, suffix).decode(), lang)
         if progress and i % 4000 == 0:
             progress(i, total, f"Resolving voice names ({len(resolved)} found)")
     extrapolated = extrapolate_voice_names(live, paths, external_ids, resolved, progress)
@@ -2221,6 +2289,47 @@ def resolve_online_voices(game, voice_paths, external_ids, progress=None):
         progress(total, total, f"Voice names: {len(resolved)} resolved "
                                f"({extrapolated} extrapolated)")
     return resolved
+
+
+# ---------------------------------------------------------------- name resolution pipeline
+
+# The whole naming pass shared by CLI and GUI, deduped at the end.
+# Names file, local state harvest, exported matches, online voices and labels, music branch rows.
+def resolve_all_matches(index, names, scan_root, names_path=None, vo_data=None,
+                        progress=None, cancel=None):
+    counts = {}
+    matches, unmatched = match_names(names, index, progress=progress) if names else ([], [])
+    state_names = harvest_local_state_names(scan_root, progress=progress, cancel=cancel)
+    counts["local_state_candidates"] = len(state_names)
+    online_candidates = (vo_data or {}).get("state_candidates") or []
+    if online_candidates:
+        state_names = sorted(set(state_names) | set(online_candidates))
+    if state_names and not (cancel and cancel()):
+        state_matches, _ = match_names(state_names, index, progress=progress)
+        matches.extend(state_matches)
+    matches = apply_exported_matches(names_path, index, matches)
+    if vo_data and index.external_locations:
+        if vo_data.get("online"):
+            resolved = resolve_online_voices(vo_data["game"], vo_data["voice_paths"],
+                                             index.external_locations.keys(), progress=progress)
+            voice_label = lambda lang, path: path
+        else:
+            resolved = crack_vo_names(vo_data.get("vo_prefixes", []), vo_data.get("vo_sources", []),
+                                      index.external_locations.keys(), progress=progress)
+            voice_label = lambda lang, path: f"{lang}/Ex/{path}"
+        for ext_hash, (path, lang) in resolved.items():
+            matches.append(NameMatch(voice_label(lang, path), "External", [ext_hash], ext_hash))
+        counts["voices"] = len(resolved)
+    if vo_data and vo_data.get("id_names"):
+        labels = resolve_online_labels(vo_data["id_names"], index)
+        for label_name, category, oid, wems in labels:
+            matches.append(NameMatch(label_name, category, wems, oid))
+        counts["labels"] = len(labels)
+    branches = music_branch_matches(index, matches)
+    matches.extend(branches)
+    counts["music_branches"] = len(branches)
+    matches = dedupe_matches(matches)
+    return matches, prune_unmatched(matches, unmatched), counts
 
 
 # ---------------------------------------------------------------- CLI mode
@@ -2242,7 +2351,7 @@ def run_cli(args):
             sys.stdout.write("\r" + line.ljust(90))
             sys.stdout.flush()
         elif now - state["last"] >= 5 or cur >= tot:
-            # redirected output: one line every 5s so progress is visible in logs/files
+            # With redirected output one line every 5s keeps progress visible in logs.
             state["last"] = now
             print(line, flush=True)
 
@@ -2263,10 +2372,12 @@ def run_cli(args):
                                     config=load_config(), force=args.vo_online_refresh)
         vo_data = {"online": True, "game": args.vo_online,
                    "voice_paths": meta.get("voice_paths", []),
-                   "id_names": meta.get("id_names", {})}
+                   "id_names": meta.get("id_names", {}),
+                   "state_candidates": meta.get("state_candidates", [])}
         names.extend(meta.get("names", []))
         print(f"  online data [{args.vo_online}]: {len(meta.get('voice_paths', []))} voice, "
-              f"{len(meta.get('names', []))} names, {len(meta.get('id_names', {}))} id-labels "
+              f"{len(meta.get('names', []))} names, {len(meta.get('id_names', {}))} id-labels, "
+              f"{len(meta.get('state_candidates', []))} cfg candidates "
               f"(updated {meta.get('updated')})")
 
     if args.harvest:
@@ -2297,41 +2408,19 @@ def run_cli(args):
     linked = sum(1 for e in index.event_actions if index.wems_for_event(e))
     print(f"  events with >=1 resolved wem: {linked}/{len(index.event_actions)}")
 
-    state_names = harvest_local_state_names(args.scan, progress=prog)
-    if state_names:
-        print(f"  local state candidates: {len(state_names)} (ZZZ data blocks)")
+    matches, unmatched, counts = resolve_all_matches(
+        index, names, args.scan, names_path=args.names, vo_data=vo_data, progress=prog)
+    if counts.get("local_state_candidates"):
+        print(f"\n  local state candidates: {counts['local_state_candidates']} (ZZZ data blocks)")
+    if "voices" in counts:
+        pct = counts["voices"] / max(1, len(index.external_locations)) * 100
+        print(f"  voice names recovered: {counts['voices']} / {len(index.external_locations)} externals ({pct:.1f}%)")
+    if "labels" in counts:
+        print(f"  audio labels applied: {counts['labels']} (MusicSegment & co.)")
+    if counts.get("music_branches"):
+        print(f"  music branches labeled: {counts['music_branches']}")
 
-    if names or vo_data or state_names:
-        matches, unmatched = match_names(names, index) if names else ([], [])
-        if state_names:
-            state_matches, _ = match_names(state_names, index, progress=prog)
-            matches.extend(state_matches)
-        matches = apply_exported_matches(args.names, index, matches)
-        if vo_data and index.external_locations:
-            if vo_data.get("online"):
-                resolved = resolve_online_voices(vo_data["game"], vo_data["voice_paths"],
-                                                 index.external_locations.keys(), progress=prog)
-                label = lambda lang, path: path
-            else:
-                resolved = crack_vo_names(vo_data["vo_prefixes"], vo_data["vo_sources"],
-                                          index.external_locations.keys(), progress=prog)
-                label = lambda lang, path: f"{lang}/Ex/{path}"
-            print()
-            for ext_hash, (path, lang) in resolved.items():
-                matches.append(NameMatch(label(lang, path), "External", [ext_hash], ext_hash))
-            pct = len(resolved) / max(1, len(index.external_locations)) * 100
-            print(f"  voice names recovered: {len(resolved)} / {len(index.external_locations)} externals ({pct:.1f}%)")
-        if vo_data and vo_data.get("id_names"):
-            labels = resolve_online_labels(vo_data["id_names"], index)
-            for lname, category, oid, wems in labels:
-                matches.append(NameMatch(lname, category, wems, oid))
-            print(f"  audio labels applied: {len(labels)} (MusicSegment & co.)")
-        branches = music_branch_matches(index, matches)
-        if branches:
-            matches.extend(branches)
-            print(f"  music branches labeled: {len(branches)}")
-        matches = dedupe_matches(matches)
-        unmatched = prune_unmatched(matches, unmatched)
+    if matches or names:
         by_kind = defaultdict(int)
         with_wems = 0
         located = 0
@@ -2349,14 +2438,14 @@ def run_cli(args):
             n = export_txt(matches, args.export_txt)
             print(f"  exported {n} event names -> {args.export_txt}")
         if args.export_json:
-            src = args.names or f"harvest:{args.harvest}"
-            n = export_json(matches, unmatched, index, args.scan, src, args.export_json)
+            names_source = args.names or f"harvest:{args.harvest}"
+            n = export_json(matches, unmatched, index, args.scan, names_source, args.export_json)
             print(f"  exported {n} events -> {args.export_json}")
         for m in matches[: args.sample]:
             locs = []
             for w in m.wem_ids[:4]:
-                ll = locations_for(index, w)
-                locs.append(f"{w}@{ll[0].label()}" if ll else f"{w}@?")
+                wem_locs = locations_for(index, w)
+                locs.append(f"{w}@{wem_locs[0].label()}" if wem_locs else f"{w}@?")
             print(f"    [{m.kind}] {m.name} -> {len(m.wem_ids)} wem  {locs}")
 
 
@@ -2640,34 +2729,11 @@ def run_gui():
                 if self._cancel:
                     self.failed.emit("Scan cancelled")
                     return
-                matches, unmatched = match_names(self.names, index, progress=self.progressed.emit)
-                state_names = harvest_local_state_names(self.folder, progress=self.progressed.emit,
-                                                        cancel=lambda: self._cancel)
-                if state_names and not self._cancel:
-                    state_matches, _ = match_names(state_names, index, progress=self.progressed.emit)
-                    matches.extend(state_matches)
-                matches = apply_exported_matches(self.names_path, index, matches)
-                if self.vo_data and index.external_locations:
-                    if self.vo_data.get("online"):
-                        resolved = resolve_online_voices(self.vo_data["game"],
-                                                         self.vo_data["voice_paths"],
-                                                         index.external_locations.keys(),
-                                                         progress=self.progressed.emit)
-                        vo_label = lambda lang, path: path
-                    else:
-                        resolved = crack_vo_names(self.vo_data.get("vo_prefixes", []),
-                                                  self.vo_data.get("vo_sources", []),
-                                                  index.external_locations.keys(),
-                                                  progress=self.progressed.emit)
-                        vo_label = lambda lang, path: f"{lang}/Ex/{path}"
-                    for ext_hash, (path, lang) in resolved.items():
-                        matches.append(NameMatch(vo_label(lang, path), "External", [ext_hash], ext_hash))
-                if self.vo_data and self.vo_data.get("id_names"):
-                    for lname, category, oid, wems in resolve_online_labels(self.vo_data["id_names"], index):
-                        matches.append(NameMatch(lname, category, wems, oid))
-                matches.extend(music_branch_matches(index, matches))
-                matches = dedupe_matches(matches)
-                self.finished_ok.emit(index, matches, prune_unmatched(matches, unmatched))
+                matches, unmatched, _counts = resolve_all_matches(
+                    index, self.names, self.folder, names_path=self.names_path,
+                    vo_data=self.vo_data, progress=self.progressed.emit,
+                    cancel=lambda: self._cancel)
+                self.finished_ok.emit(index, matches, unmatched)
             except Exception as e:
                 self.failed.emit(str(e))
 
@@ -2812,6 +2878,8 @@ def run_gui():
             self.active_bucket = "all"
             self.worker = None
             self.harvest_worker = None
+            self._online_worker = None
+            self._play_seq = 0
             self.convert_worker = None
             self.export_worker = None
             self.vgm_worker = None
@@ -2840,7 +2908,7 @@ def run_gui():
             self.game_group = QButtonGroup(self)
             for game in GAME_ORDER:
                 radio = QRadioButton(GAME_UI[game]["label"])
-                radio.setToolTip(f"{game}: decrittazione .blk {GAME_UI[game]['decrypt']}")
+                radio.setToolTip(f"{game}: .blk decryption {GAME_UI[game]['decrypt']}")
                 radio.clicked.connect(lambda _=False, g=game: self.on_game_changed(g))
                 self.game_group.addButton(radio)
                 self.game_buttons[game] = radio
@@ -2866,7 +2934,7 @@ def run_gui():
             (harvest_box, self.harvest_chk, self.harvest_tag,
              self.harvest_val, _) = self._make_source_box("Client harvest", "", None)
             self.harvest_chk.setChecked(True)
-            self.harvest_chk.setToolTip("Usa i nomi raccolti nel tab \"Generate names\"")
+            self.harvest_chk.setToolTip("Use the names harvested in the \"Generate names\" tab")
             row2.addWidget(harvest_box, 1)
 
             (online_box, self.online_chk, self.online_tag,
@@ -2909,7 +2977,7 @@ def run_gui():
             header.setCascadingSectionResizes(False)
             # Widths redone for the rail view: the old ones overflowed and scrollbars appeared.
             saved = self.cfg.get("column_widths_v2") or []
-            # external ids are 64-bit: wide column
+            # External ids are 64-bit, so the column is wide.
             defaults = [560, 116, 116, 70, 62]
             for i, width in enumerate(defaults):
                 self.tree.setColumnWidth(i, saved[i] if i < len(saved) and saved[i] > 20 else width)
@@ -3000,7 +3068,7 @@ def run_gui():
             self.progress.setTextVisible(False)
             self.progress.setMaximumHeight(12)
             self.progress.setFixedWidth(170)
-            # only visible while something is running
+            # Only visible while something is running.
             self.progress.setVisible(False)
             bar.addPermanentWidget(self.progress)
             self.detail_lbl = QLabel("")
@@ -3125,7 +3193,7 @@ def run_gui():
             folders = dict(self.cfg.get("folders") or {})
             current = self.folder_edit.text().strip()
             if previous in GAME_UI and previous != game and current:
-                # remember where the other game was
+                # Remembers where the other game was.
                 folders[previous] = current
             self.cfg["game"] = game
             self.cfg["folders"] = folders
@@ -3326,7 +3394,7 @@ def run_gui():
         def pick_harvest_folder(self):
             p = QFileDialog.getExistingDirectory(self, "Blocks folder", self.harvest_edit.text() or "")
             if p:
-                # explicit choice: never overwrite it again
+                # An explicit choice is never overwritten again.
                 self._blocks_auto = False
                 self.harvest_edit.setText(p)
 
@@ -3434,7 +3502,7 @@ def run_gui():
         # ---------- online names
 
         def start_online_fetch(self):
-            if getattr(self, '_online_worker', None) and self._online_worker.isRunning():
+            if self._online_worker and self._online_worker.isRunning():
                 return
             game = self.current_game()
             if not GAME_UI[game]["has_online"]:
@@ -3450,6 +3518,13 @@ def run_gui():
         def _online_payload_ready(self):
             return bool(self.online_payload) and self.online_payload.get("game") == self.current_game()
 
+        def _set_online_payload(self, game, meta):
+            self.online_payload = {"online": True, "game": game,
+                                   "voice_paths": meta.get("voice_paths", []),
+                                   "id_names": meta.get("id_names", {}),
+                                   "state_candidates": meta.get("state_candidates", [])}
+            self._online_names = meta.get("names", [])
+
         def _load_online_cache(self):
             game = self.current_game()
             cache = _voice_cache_file(game)
@@ -3459,18 +3534,12 @@ def run_gui():
                 meta = json.loads(cache.read_text(encoding="utf-8"))
             except Exception:
                 return False
-            self.online_payload = {"online": True, "game": game,
-                                   "voice_paths": meta.get("voice_paths", []),
-                                   "id_names": meta.get("id_names", {})}
-            self._online_names = meta.get("names", [])
+            self._set_online_payload(game, meta)
             self._sync_game_ui()
             return True
 
         def on_online_ready(self, game, meta):
-            self.online_payload = {"online": True, "game": game,
-                                   "voice_paths": meta.get("voice_paths", []),
-                                   "id_names": meta.get("id_names", {})}
-            self._online_names = meta.get("names", [])
+            self._set_online_payload(game, meta)
             self.online_btn.setEnabled(True)
             self.online_chk.setChecked(True)
             self.online_val.setText(
@@ -3613,7 +3682,7 @@ def run_gui():
                 if os.environ.get("HSI_COLTEST"):
                     header = self.tree.header()
                     before = [self.tree.columnWidth(i) for i in range(5)]
-                    # simulates the drag
+                    # Simulates the drag.
                     header.resizeSection(1, before[1] + 120)
                     after = [self.tree.columnWidth(i) for i in range(5)]
                     print("larghezze prima:", before, "dopo:", after, flush=True)
@@ -3751,7 +3820,7 @@ def run_gui():
                 self._lookup_item.setExpanded(True)
             self.tree.setUpdatesEnabled(True)
             if os.environ.get("HSI_TIMING"):
-                print(f"[timing] albero con {len(items)} righe: {time.time()-_t0:.2f}s", flush=True)
+                print(f"[timing] tree with {len(items)} rows: {time.time()-_t0:.2f}s", flush=True)
 
         def _type_icon(self, bucket):
             icon = self._type_icons.get(bucket)
@@ -3780,7 +3849,7 @@ def run_gui():
             if len(m.wem_ids) > 500:
                 item.addChild(QTreeWidgetItem([f"... {len(m.wem_ids) - 500} more wems", "", "", "", ""]))
             if _t0 is not None:
-                print(f"[timing] espansione {len(m.wem_ids)} wem: {time.time()-_t0:.3f}s", flush=True)
+                print(f"[timing] expanding {len(m.wem_ids)} wems: {time.time()-_t0:.3f}s", flush=True)
 
         def schedule_filter(self):
             self.filter_timer.start()
@@ -4011,14 +4080,14 @@ def run_gui():
             self.player.setSource(QUrl())
             self.play_lbl.setText("Converting...")
             self._pending_loc = loc
-            self._play_seq = getattr(self, "_play_seq", 0) + 1
+            self._play_seq += 1
             self.convert_worker = ConvertWorker(loc, self.vgmstream, self.temp_dir,
                                                 f"hsi_{self._play_seq}")
             self.convert_worker.done.connect(self.on_wav_ready)
             self.convert_worker.failed.connect(lambda e: self.play_lbl.setText(f"Error: {e}"))
             self.convert_worker.start()
             if _t0 is not None:
-                print(f"[timing] play_selected (thread GUI): {time.time()-_t0:.3f}s", flush=True)
+                print(f"[timing] play_selected (GUI thread): {time.time()-_t0:.3f}s", flush=True)
 
         def on_wav_ready(self, wav_path):
             self.play_lbl.setText("")
@@ -4161,7 +4230,7 @@ def run_gui():
         try:
             handle = int(widget.winId())
             flag = ctypes.c_int(1)
-            # DWMWA_USE_IMMERSIVE_DARK_MODE, old and new value
+            # DWMWA_USE_IMMERSIVE_DARK_MODE, old and new value.
             for attribute in (20, 19):
                 ctypes.windll.dwmapi.DwmSetWindowAttribute(
                     handle, attribute, ctypes.byref(flag), ctypes.sizeof(flag))
