@@ -463,6 +463,62 @@ def parse_dialogue_children(raw, p, end):
     return out
 
 
+def _decode_music_tree(tree, depth):
+    count = len(tree) // 12
+    if not count:
+        return None
+    nodes = [struct.unpack_from("<IIHH", tree, i * 12) for i in range(count)]
+    leaves = []
+
+    def visit(idx, level, path):
+        key, union = nodes[idx][0], nodes[idx][1]
+        cidx, ccount = union & 0xFFFF, union >> 16
+        # Children must sit forward in the array; anything else is an audio-node leaf.
+        if level >= depth or ccount == 0 or ccount > 128 or cidx <= idx or cidx + ccount > count:
+            leaves.append((tuple(path + [key]), union))
+            return
+        for k in range(ccount):
+            visit(cidx + k, level + 1, path + [key])
+
+    root_union = nodes[0][1]
+    root_cidx, root_count = root_union & 0xFFFF, root_union >> 16
+    if not root_count or root_cidx + root_count > count:
+        return None
+    for k in range(root_count):
+        visit(root_cidx + k, 1, [])
+    return leaves
+
+
+# MusicSwitchCntr branch data sits at the tail of the object:
+# [continuePlayback u8][treeDepth u32][groupID u32 * depth][groupType u8 * depth]
+# [treeSize u32][mode u8][nodes 12B: key, audioNodeID | (childIdx u16, childCount u16), weight, prob].
+# The front (NodeBaseParams + transition rules) shifts across Wwise versions, so the tail
+# is located by scanning candidate sizes and validating depth and leaf targets.
+def parse_music_switch_tree(raw, p, end, object_ids):
+    for tree_size in range(12, end - p - 9, 12):
+        x = end - tree_size - 5
+        if x - 9 < p:
+            break
+        if struct.unpack_from("<I", raw, x)[0] != tree_size:
+            continue
+        for depth in range(1, 9):
+            dep_off = x - 5 * depth - 4
+            if dep_off < p:
+                break
+            if struct.unpack_from("<I", raw, dep_off)[0] != depth:
+                continue
+            groups = struct.unpack_from(f"<{depth}I", raw, dep_off + 4)
+            gtypes = tuple(raw[dep_off + 4 + 4 * depth: dep_off + 4 + 5 * depth])
+            leaves = _decode_music_tree(raw[x + 5: x + 5 + tree_size], depth)
+            if not leaves:
+                continue
+            good = sum(1 for _, t in leaves if t == 0 or t in object_ids)
+            if good < len(leaves) * 0.7:
+                continue
+            return groups, gtypes, leaves
+    return None
+
+
 # ---------------------------------------------------------------- scanner
 
 class ScanIndex:
@@ -479,6 +535,7 @@ class ScanIndex:
         self.object_ids = set()
         self.sync_ids = {}
         self.named_objects = {}
+        self.music_trees = {}
         self.stats = defaultdict(int)
         self.inv = None
 
@@ -746,6 +803,12 @@ def scan_folder(root, progress=None, cancel=None):
                     parent = parse_parent(raw, p + 1, end, music_variant)
                     if parent and parent in index.object_ids:
                         index.parents[oid].add(parent)
+                    if otype == HIRC_MUSIC_SWITCH:
+                        tree = parse_music_switch_tree(raw, p, end, index.object_ids)
+                        # The same switch recurs across banks; the fullest copy (Patch.pck) wins.
+                        if tree and (oid not in index.music_trees
+                                     or len(tree[2]) > len(index.music_trees[oid][2])):
+                            index.music_trees[oid] = tree
                 elif otype == HIRC_DIALOGUE_EVENT:
                     kids = [k for k in parse_dialogue_children(raw, p, end)
                             if k and k in index.object_ids]
@@ -759,8 +822,19 @@ def scan_folder(root, progress=None, cancel=None):
         if progress and i % 20 == 0:
             progress(i + 1, len(hirc_metas), "Parsing HIRC (2/2)...")
 
+    # Group/value ids of the music trees become matchable syncs, so state names attach to them.
+    for groups, gtypes, leaves in index.music_trees.values():
+        for gid, gt in zip(groups, gtypes):
+            if gid:
+                index.sync_ids.setdefault(gid, "Switch group" if gt == 0 else "State group")
+        for keys, _target in leaves:
+            for gt, key in zip(gtypes, keys):
+                if key:
+                    index.sync_ids.setdefault(key, "Switch" if gt == 0 else "State")
+
     index.stats["pck"] = len(pck_files)
     index.stats["bnk_inline"] = len(bnk_metas)
+    index.stats["music_switch_trees"] = len(index.music_trees)
     index.stats["wem_ids"] = len(index.wem_locations)
     index.stats["externals"] = len(index.external_locations)
     index.stats["objects"] = len(index.object_ids)
@@ -872,6 +946,68 @@ def _wems_for_object(index, oid):
         inv = index.inv or {}
         return sorted(set(inv.get(oid, set())) | set(index.node_srcs.get(oid, set())))
     return []
+
+
+MUSIC_BRANCH_KIND = "Music branch"
+
+
+# One row per music-switch leaf whose state path got at least one name back
+# (e.g. "Stage_Combat_Boss / Cottus" for the boss theme wems). Nested switches
+# compose their paths, so the label reads outermost to innermost.
+def music_branch_matches(index, matches):
+    trees = index.music_trees
+    if not trees:
+        return []
+    needed = set()
+    for _groups, _gtypes, leaves in trees.values():
+        for keys, _target in leaves:
+            needed.update(k for k in keys if k)
+    key_names = {m.hash_id: m.name for m in matches if m.hash_id in needed}
+    if not key_names:
+        return []
+    inv = index.inv or {}
+    per_target = {}  # leaf target -> [label, resolved_count, wems]
+
+    def expand(oid, prefix, seen):
+        for keys, target in trees[oid][2]:
+            path = prefix + list(keys)
+            if target in trees and target not in seen:
+                expand(target, path, seen | {target})
+            elif target:
+                # "None" is the default state: it names nothing, it only pads the path.
+                resolved = [key_names[k] for k in path
+                            if k in key_names and key_names[k].lower() != "none"]
+                if not resolved:
+                    continue
+                wems = set(inv.get(target, ())) | set(index.node_srcs.get(target, ()))
+                if not wems:
+                    continue
+                label = " / ".join(resolved)
+                row = per_target.get(target)
+                if row is None:
+                    per_target[target] = [label, len(resolved), wems]
+                else:
+                    # The same node reached along two paths keeps the most specific label.
+                    if len(resolved) > row[1]:
+                        row[0], row[1] = label, len(resolved)
+                    row[2] |= wems
+
+    leaf_targets = {t for _g, _gt, leaves in trees.values() for _keys, t in leaves}
+    for oid in trees:
+        if oid not in leaf_targets:
+            expand(oid, [], {oid})
+    # Segments of the same musical situation land on distinct leaves: one row per label.
+    rows = {}
+    for target, (label, _n, wems) in sorted(per_target.items()):
+        row = rows.get(label)
+        if row is None:
+            rows[label] = [target, set(wems)]
+        else:
+            row[1] |= wems
+    out = [NameMatch(label, MUSIC_BRANCH_KIND, sorted(wems), target)
+           for label, (target, wems) in rows.items()]
+    out.sort(key=lambda m: m.name.lower())
+    return out
 
 
 # Rebuilds the matches of an export from the saved id, not from the name hash.
@@ -1136,6 +1272,47 @@ def _harvest_file(path, prefixes, game=None):
     except Exception:
         pass
     return found, set(), set()
+
+
+# ZZZ keeps its config tables (chapters, bosses, scenes, jukebox) in a handful of
+# small data blocks: their strings are the candidate pool that names the music states.
+ZZZ_DATA_BLOCK_DIRS = (
+    ("ZenlessZoneZero_Data", "Persistent", "Blocks", "Data"),
+    ("Persistent", "Blocks", "Data"),
+)
+_STATE_NAME_RE = re.compile(rb"[A-Za-z][A-Za-z0-9_]{2,79}")
+
+
+def harvest_local_state_names(scan_root, progress=None, cancel=None):
+    base = None
+    for parts in ZZZ_DATA_BLOCK_DIRS:
+        cand = Path(scan_root).joinpath(*parts)
+        if cand.is_dir():
+            base = cand
+            break
+    if base is None:
+        return []
+    files = sorted(base.glob("*.blk"))
+    seen = set()
+    for i, blk in enumerate(files):
+        if cancel and cancel():
+            break
+        if progress:
+            progress(i, len(files), f"Reading data blocks for state names ({len(seen)})...")
+        try:
+            for block in iter_blk_blocks(str(blk), "ZZZ"):
+                seen.update(m.group() for m in _STATE_NAME_RE.finditer(block))
+        except Exception:
+            continue
+    names = []
+    for s in seen:
+        try:
+            names.append(s.decode("ascii"))
+        except UnicodeDecodeError:
+            pass
+    if progress:
+        progress(len(files), len(files) or 1, f"State candidates: {len(names)}")
+    return sorted(names)
 
 
 def harvest_names(folder, prefixes, progress=None, cancel=None, game=None):
@@ -1502,7 +1679,15 @@ VOICE_SOURCES = {
         "music_cfg": "FileCfg/MusicPlayerConfigTemplateTb.json",
         "textmap": "TextMap/TextMap_ENTemplateTb.json",
         "textmap_overwrite": "TextMap/TextMap_ENOverwriteTemplateTb.json",
-        "event_cfg_files": ["FileCfg/AudioEventTemplateTb.json"],
+        # The extra tables carry readable Play_* events (custom/default/scene sounds)
+        # and the state names of the BGM music switches (BigSceneBGM & co.).
+        "event_cfg_files": ["FileCfg/AudioEventTemplateTb.json",
+                            "FileCfg/CustomSoundEventTemplateTb.json",
+                            "FileCfg/DefaultSoundEventTemplateTb.json",
+                            "FileCfg/SceneSoundConfigTemplateTb.json",
+                            "FileCfg/BigSceneBGMTemplateTb.json",
+                            "FileCfg/SmithyMusicConfigTemplateTb.json",
+                            "FileCfg/MainCityBGMConfigTemplateTb.json"],
     },
     "SR": {
         "label": "Star Rail - Dimbreath/turnbasedgamedata",
@@ -1553,7 +1738,7 @@ def bucket_of_kind(kind):
         return "voice"
     if kind in ("Event", "DialogueEvent"):
         return "event"
-    if kind in ("MusicSegment", "Music"):
+    if kind in ("MusicSegment", "Music", "Music branch"):
         return "music"
     if kind == "Bank":
         return "bank"
@@ -2112,8 +2297,15 @@ def run_cli(args):
     linked = sum(1 for e in index.event_actions if index.wems_for_event(e))
     print(f"  events with >=1 resolved wem: {linked}/{len(index.event_actions)}")
 
-    if names or vo_data:
+    state_names = harvest_local_state_names(args.scan, progress=prog)
+    if state_names:
+        print(f"  local state candidates: {len(state_names)} (ZZZ data blocks)")
+
+    if names or vo_data or state_names:
         matches, unmatched = match_names(names, index) if names else ([], [])
+        if state_names:
+            state_matches, _ = match_names(state_names, index, progress=prog)
+            matches.extend(state_matches)
         matches = apply_exported_matches(args.names, index, matches)
         if vo_data and index.external_locations:
             if vo_data.get("online"):
@@ -2134,6 +2326,10 @@ def run_cli(args):
             for lname, category, oid, wems in labels:
                 matches.append(NameMatch(lname, category, wems, oid))
             print(f"  audio labels applied: {len(labels)} (MusicSegment & co.)")
+        branches = music_branch_matches(index, matches)
+        if branches:
+            matches.extend(branches)
+            print(f"  music branches labeled: {len(branches)}")
         matches = dedupe_matches(matches)
         unmatched = prune_unmatched(matches, unmatched)
         by_kind = defaultdict(int)
@@ -2445,6 +2641,11 @@ def run_gui():
                     self.failed.emit("Scan cancelled")
                     return
                 matches, unmatched = match_names(self.names, index, progress=self.progressed.emit)
+                state_names = harvest_local_state_names(self.folder, progress=self.progressed.emit,
+                                                        cancel=lambda: self._cancel)
+                if state_names and not self._cancel:
+                    state_matches, _ = match_names(state_names, index, progress=self.progressed.emit)
+                    matches.extend(state_matches)
                 matches = apply_exported_matches(self.names_path, index, matches)
                 if self.vo_data and index.external_locations:
                     if self.vo_data.get("online"):
@@ -2464,6 +2665,7 @@ def run_gui():
                 if self.vo_data and self.vo_data.get("id_names"):
                     for lname, category, oid, wems in resolve_online_labels(self.vo_data["id_names"], index):
                         matches.append(NameMatch(lname, category, wems, oid))
+                matches.extend(music_branch_matches(index, matches))
                 matches = dedupe_matches(matches)
                 self.finished_ok.emit(index, matches, prune_unmatched(matches, unmatched))
             except Exception as e:
@@ -2604,6 +2806,8 @@ def run_gui():
             self._suppress_detect = False
             self._match_buckets = []
             self._match_langs = []
+            self._wems_by_bnk = defaultdict(set)
+            self._id_strings = []
             self._type_icons = {}
             self.active_bucket = "all"
             self.worker = None
