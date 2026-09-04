@@ -26,7 +26,7 @@ from shutil import which
 
 import certifi
 from blkdec import iter_blk_blocks, oodle_available
-from PyQt6.QtCore import QPoint, QRectF, Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QEvent, QPoint, QRectF, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPainterPath, QPixmap,
 )
@@ -490,6 +490,82 @@ def _decode_music_tree(tree, depth):
     return leaves
 
 
+# The DialogueEvent front is [probability u8][depth u32][groups u32*d][types u8*d][treeSize u32][mode u8][nodes 12B].
+# Same tree as the music switch: the leaf path is one key per group, the leaf target the audio node.
+def parse_dialogue_tree(raw, p, end):
+    if p + 10 > end:
+        return None
+    depth = struct.unpack_from("<I", raw, p + 1)[0]
+    if not depth or depth > 16:
+        return None
+    q = p + 5
+    if q + depth * 5 + 5 > end:
+        return None
+    groups = struct.unpack_from(f"<{depth}I", raw, q)
+    group_types = tuple(raw[q + 4 * depth: q + 5 * depth])
+    q += depth * 5
+    tree_size = struct.unpack_from("<I", raw, q)[0]
+    q += 5
+    if tree_size % 12 or q + tree_size > end:
+        return None
+    leaves = _decode_music_tree(raw[q:q + tree_size], depth)
+    if not leaves:
+        return None
+    return groups, group_types, leaves
+
+
+# After the NodeBaseParams the SwitchCntr tail is [groupType u8][groupId u32][default u32][continuous u8]
+# [numChildren u32][children][numSwitches u32]{[switchId u32][numNodes u32][nodes]}[numParams u32][params].
+# The NodeBaseParams size varies, so every offset is probed for a tail that closes exactly on the object end.
+SWITCH_PARAM_SIZES = (14, 18)
+
+
+def parse_switch_container(raw, p, end, object_ids):
+    for q in range(p, end - 22):
+        group_type = raw[q]
+        if group_type > 1 or raw[q + 9] > 1:
+            continue
+        group_id = struct.unpack_from("<I", raw, q + 1)[0]
+        if not group_id:
+            continue
+        r = q + 10
+        num_children = struct.unpack_from("<I", raw, r)[0]
+        r += 4
+        if num_children > 4096 or r + num_children * 4 + 4 > end:
+            continue
+        children = struct.unpack_from(f"<{num_children}I", raw, r)
+        r += num_children * 4
+        if any(child not in object_ids for child in children):
+            continue
+        num_switches = struct.unpack_from("<I", raw, r)[0]
+        r += 4
+        if num_switches > 4096:
+            continue
+        assignments = {}
+        valid = True
+        for _ in range(num_switches):
+            if r + 8 > end:
+                valid = False
+                break
+            switch_id, num_nodes = struct.unpack_from("<II", raw, r)
+            r += 8
+            if num_nodes > 4096 or r + num_nodes * 4 > end:
+                valid = False
+                break
+            # The nodes are usually the children above, but some banks assign nodes the list leaves out.
+            nodes = struct.unpack_from(f"<{num_nodes}I", raw, r)
+            r += num_nodes * 4
+            assignments.setdefault(switch_id, set()).update(nodes)
+        if not valid or r + 4 > end:
+            continue
+        num_params = struct.unpack_from("<I", raw, r)[0]
+        r += 4
+        if not any(r + num_params * size == end for size in SWITCH_PARAM_SIZES):
+            continue
+        return group_type, group_id, assignments
+    return None
+
+
 # The MusicSwitchCntr tail is [continue u8][depth u32][groups u32*d][types u8*d][treeSize u32][mode u8][nodes 12B].
 # The front shifts across Wwise versions, so the tail is found by probing sizes and validating depth and leaf targets.
 def parse_music_switch_tree(raw, p, end, object_ids):
@@ -535,6 +611,14 @@ class ScanIndex:
         self.action_syncs = {}
         self.named_objects = {}
         self.music_trees = {}
+        self.dialogue_trees = {}
+        # SwitchCntr id -> (group type, group id, {switch value: child node ids}).
+        self.switch_containers = {}
+        # Filled by build_sync_links once the hierarchy is complete.
+        self.sync_wems = {}
+        self.wem_tags = {}
+        self.event_tags = {}
+        self.group_values = {}
         self.stats = defaultdict(int)
         self.inv = None
 
@@ -560,6 +644,60 @@ class ScanIndex:
             for c in chain:
                 inv[c] |= srcs
         self.inv = inv
+
+    def wems_under(self, node):
+        return set((self.inv or {}).get(node, ())) | set(self.node_srcs.get(node, ()))
+
+    # Every selector (switch containers, music and dialogue trees) links its group and value ids to the
+    # wems they choose. The wem side of the same link becomes its tags, the way the old tools showed them.
+    # A SetState/SetSwitch action tags its event instead: the event uses the value, it does not contain audio.
+    def build_sync_links(self):
+        sync_wems = defaultdict(set)
+        wem_tags = defaultdict(set)
+        group_values = defaultdict(set)
+
+        def link(group_id, value_id, wems):
+            if not group_id:
+                return
+            if value_id:
+                group_values[group_id].add(value_id)
+            if not wems:
+                return
+            sync_wems[group_id] |= wems
+            if value_id:
+                sync_wems[value_id] |= wems
+                for wid in wems:
+                    wem_tags[wid].add((group_id, value_id))
+
+        for _group_type, group_id, assignments in self.switch_containers.values():
+            for value_id, nodes in assignments.items():
+                wems = set()
+                for node in nodes:
+                    wems |= self.wems_under(node)
+                link(group_id, value_id, wems)
+        for trees in (self.music_trees, self.dialogue_trees):
+            for groups, _group_types, leaves in trees.values():
+                for keys, target in leaves:
+                    wems = self.wems_under(target) if target else set()
+                    for group_id, key in zip(groups, keys):
+                        link(group_id, key, wems)
+
+        event_tags = defaultdict(set)
+        for event_id, action_ids in self.event_actions.items():
+            for aid in action_ids:
+                touched = self.action_syncs.get(aid)
+                action = self.actions.get(aid)
+                if not touched or not action:
+                    continue
+                if action[0] in (ACTION_SET_STATE, ACTION_SET_SWITCH) and len(touched) == 2:
+                    event_tags[event_id].add((touched[0], touched[1]))
+                    group_values[touched[0]].add(touched[1])
+                else:
+                    event_tags[event_id].update((sid, 0) for sid in touched)
+        self.sync_wems = dict(sync_wems)
+        self.wem_tags = dict(wem_tags)
+        self.event_tags = dict(event_tags)
+        self.group_values = dict(group_values)
 
     def wems_for_event(self, event_id):
         out = set()
@@ -802,6 +940,12 @@ def scan_folder(root, progress=None, cancel=None):
                     parent = parse_parent(raw, p, end, cont_variant)
                     if parent and parent in index.object_ids:
                         index.parents[oid].add(parent)
+                    if otype == HIRC_SWITCH:
+                        container = parse_switch_container(raw, p, end, index.object_ids)
+                        # The same container recurs across banks; the copy with most assignments wins.
+                        if container and (oid not in index.switch_containers
+                                          or len(container[2]) > len(index.switch_containers[oid][2])):
+                            index.switch_containers[oid] = container
                 elif otype in MUSIC_NODE_TYPES:
                     parent = parse_parent(raw, p + 1, end, music_variant)
                     if parent and parent in index.object_ids:
@@ -817,6 +961,10 @@ def scan_folder(root, progress=None, cancel=None):
                             if k and k in index.object_ids]
                     if kids:
                         index.dialogue_children[oid] |= set(kids)
+                    tree = parse_dialogue_tree(raw, p, end)
+                    if tree and (oid not in index.dialogue_trees
+                                 or len(tree[2]) > len(index.dialogue_trees[oid][2])):
+                        index.dialogue_trees[oid] = tree
                     if meta.bkhd_id:
                         index.event_banks[oid].add(meta.bkhd_id)
                     index.stats["dialogue_events"] += 1
@@ -825,19 +973,27 @@ def scan_folder(root, progress=None, cancel=None):
         if progress and i % 20 == 0:
             progress(i + 1, len(hirc_metas), "Parsing HIRC (2/2)...")
 
-    # Group/value ids of the music trees become matchable syncs, so state names attach to them.
-    for groups, group_types, leaves in index.music_trees.values():
-        for group_id, group_type in zip(groups, group_types):
-            if group_id:
-                index.sync_ids.setdefault(group_id, "Switch group" if group_type == 0 else "State group")
-        for keys, _target in leaves:
-            for group_type, key in zip(group_types, keys):
-                if key:
-                    index.sync_ids.setdefault(key, "Switch" if group_type == 0 else "State")
+    # Group/value ids of every selector become matchable syncs, so state names attach to them.
+    for trees in (index.music_trees, index.dialogue_trees):
+        for groups, group_types, leaves in trees.values():
+            for group_id, group_type in zip(groups, group_types):
+                if group_id:
+                    index.sync_ids.setdefault(group_id, "Switch group" if group_type == 0 else "State group")
+            for keys, _target in leaves:
+                for group_type, key in zip(group_types, keys):
+                    if key:
+                        index.sync_ids.setdefault(key, "Switch" if group_type == 0 else "State")
+    for group_type, group_id, assignments in index.switch_containers.values():
+        index.sync_ids.setdefault(group_id, "Switch group" if group_type == 0 else "State group")
+        for value_id in assignments:
+            if value_id:
+                index.sync_ids.setdefault(value_id, "Switch" if group_type == 0 else "State")
 
     index.stats["pck"] = len(pck_files)
     index.stats["bnk_inline"] = len(bnk_metas)
     index.stats["music_switch_trees"] = len(index.music_trees)
+    index.stats["dialogue_trees"] = len(index.dialogue_trees)
+    index.stats["switch_containers"] = len(index.switch_containers)
     index.stats["wem_ids"] = len(index.wem_locations)
     index.stats["externals"] = len(index.external_locations)
     index.stats["objects"] = len(index.object_ids)
@@ -846,6 +1002,7 @@ def scan_folder(root, progress=None, cancel=None):
     if progress:
         progress(1, 1, "Building reverse index...")
     index.build_inverted()
+    index.build_sync_links()
     return index
 
 
@@ -1138,10 +1295,15 @@ def crack_context_names(index, matches):
             events_of[sid] |= action_events.get(aid, set())
             pair_of[sid].update(x for x in sync_ids if x != sid)
     tree_siblings = defaultdict(set)
-    for groups, _group_types, leaves in index.music_trees.values():
-        members = {g for g in groups if g}
-        for keys, _target in leaves:
-            members.update(k for k in keys if k)
+    for trees in (index.music_trees, index.dialogue_trees):
+        for groups, _group_types, leaves in trees.values():
+            members = {g for g in groups if g}
+            for keys, _target in leaves:
+                members.update(k for k in keys if k)
+            for member in members:
+                tree_siblings[member] |= members - {member}
+    for _group_type, group_id, assignments in index.switch_containers.values():
+        members = {group_id} | {value for value in assignments if value}
         for member in members:
             tree_siblings[member] |= members - {member}
     global_tokens = Counter(t for n in name_of.values() for t in n.lower().split("_")
@@ -1213,31 +1375,17 @@ def crack_context_names(index, matches):
     return out
 
 
-# The state/switch tag rows get the wems their key selects in the music trees.
+SYNC_KINDS = ("State", "Switch", "State group", "Switch group")
+
+
+# The state/switch tag rows get the wems their id selects (switch containers, music and dialogue trees).
 # Searching "Cottus" then lands on a playable row, not on an empty sync entry.
-def attach_music_tag_wems(index, matches):
-    trees = index.music_trees
-    if not trees:
+def attach_sync_wems(index, matches):
+    if not index.sync_wems:
         return
-    inv = index.inv or {}
-    wems_by_key = defaultdict(set)
-    for groups, _group_types, leaves in trees.values():
-        tree_wems = set()
-        for keys, target in leaves:
-            if not target:
-                continue
-            wems = set(inv.get(target, ())) | set(index.node_srcs.get(target, ()))
-            tree_wems |= wems
-            for key in keys:
-                if key:
-                    wems_by_key[key] |= wems
-        for group_id in groups:
-            if group_id:
-                wems_by_key[group_id] |= tree_wems
     for m in matches:
-        if (not m.wem_ids and m.hash_id in wems_by_key
-                and m.kind in ("State", "Switch", "State group", "Switch group")):
-            m.wem_ids = sorted(wems_by_key[m.hash_id])
+        if not m.wem_ids and m.kind in SYNC_KINDS and m.hash_id in index.sync_wems:
+            m.wem_ids = sorted(index.sync_wems[m.hash_id])
 
 
 # Rebuilds the matches of an export from the saved id, not from the name hash.
@@ -2585,7 +2733,7 @@ def resolve_all_matches(index, names, scan_root, names_path=None, vo_data=None,
     branches = music_branch_matches(index, matches)
     matches.extend(branches)
     counts["music_branches"] = len(branches)
-    attach_music_tag_wems(index, matches)
+    attach_sync_wems(index, matches)
     matches = dedupe_matches(matches)
     return matches, prune_unmatched(matches, unmatched), counts
 
@@ -2949,6 +3097,9 @@ def run_gui():
 
     USER_ROLE = Qt.ItemDataRole.UserRole
     _MAX_ID_LOOKUPS = 100
+    _NAME_COLUMN_MIN = 280
+    _TAGS_COLUMN_MIN = 80
+    _TAG_TEXT_LIMIT = 160
 
     def load_config():
         try:
@@ -3134,6 +3285,10 @@ def run_gui():
             self._match_langs = []
             self._wems_by_bnk = defaultdict(set)
             self._id_strings = []
+            self._name_of = {}
+            self._group_of_value = {}
+            self._tags_lower = []
+            self._tag_text_of = {}
             self._type_icons = {}
             self.active_bucket = "all"
             self.worker = None
@@ -3228,26 +3383,30 @@ def run_gui():
             self.filter_edit = QLineEdit()
             self.filter_edit.setObjectName("searchEdit")
             self.filter_edit.setPlaceholderText(
-                "search by event name (substring) or by ID — event/bank/wem id (exact match when numeric)")
+                "search by name, by tag (state/switch name or id) or by ID — event/bank/wem id")
             self.filter_edit.textChanged.connect(self.schedule_filter)
             search_row.addWidget(self.filter_edit, 1)
             right.addLayout(search_row)
 
             self.tree = QTreeWidget()
-            self.tree.setHeaderLabels(["Name / Source", "Type", "ID", "Language", "Size"])
+            self.tree.setHeaderLabels(["Name / Source", "Type", "ID", "Language", "Size", "Tags"])
             header = self.tree.header()
-            # Interactive: columns draggable by hand (double click on the separator = fit to content).
+            # Interactive everywhere: every column is draggable by hand (double click on the separator = fit to content).
+            # A Stretch section would absorb the leftover space on its own, but Qt then refuses to let the user drag it,
+            # so the fitting is done by hand in _on_section_resized.
             header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
             header.setStretchLastSection(False)
-            # The name column absorbs the leftover space: without it an empty column shows up on the right.
-            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
             header.setCascadingSectionResizes(False)
-            # Widths redone for the rail view: the old ones overflowed and scrollbars appeared.
-            saved = self.cfg.get("column_widths_v2") or []
+            header.setMinimumSectionSize(40)
+            # Widths redone for the tags column: the v2 ones were dragged under the old stretch mode and do not fit.
+            saved = self.cfg.get("column_widths_v3") or []
             # External ids are 64-bit, so the column is wide.
-            defaults = [560, 116, 116, 70, 62]
+            defaults = [560, 116, 116, 70, 62, 240]
             for i, width in enumerate(defaults):
                 self.tree.setColumnWidth(i, saved[i] if i < len(saved) and saved[i] > 20 else width)
+            self._fitting_columns = False
+            header.sectionResized.connect(self._on_section_resized)
+            self.tree.viewport().installEventFilter(self)
             self.tree.setFont(QFont("Segoe UI", 9))
             self.tree.setUniformRowHeights(True)
             self.tree.setAlternatingRowColors(True)
@@ -3911,6 +4070,44 @@ def run_gui():
             if os.environ.get("HSI_SCREENSHOT"):
                 self._screenshot_after_scan()
 
+        # ---------- columns
+
+        def eventFilter(self, obj, event):
+            if obj is self.tree.viewport() and event.type() == QEvent.Type.Resize:
+                self._fit_name_column()
+            return super().eventFilter(obj, event)
+
+        # A dragged border follows the mouse, like in a file explorer: the columns before it keep their
+        # width and the tags column at the far right absorbs the difference, down to its minimum.
+        # Past that the table overflows into a scrollbar rather than fighting the drag.
+        def _on_section_resized(self, section, old, new):
+            if self._fitting_columns:
+                return
+            last = self.tree.columnCount() - 1
+            if section == last:
+                return
+            self._fitting_columns = True
+            try:
+                tags = self.tree.columnWidth(last)
+                leftover = self.tree.viewport().width() - sum(
+                    self.tree.columnWidth(i) for i in range(last))
+                # When the table already overflows, a narrowed column reduces the overflow instead.
+                wanted = min(tags - (new - old), max(tags, leftover))
+                self.tree.setColumnWidth(last, max(_TAGS_COLUMN_MIN, wanted))
+            finally:
+                self._fitting_columns = False
+
+        # The name column takes whatever a window resize leaves over; below its minimum a scrollbar appears.
+        def _fit_name_column(self):
+            if self._fitting_columns:
+                return
+            self._fitting_columns = True
+            try:
+                others = sum(self.tree.columnWidth(i) for i in range(1, self.tree.columnCount()))
+                self.tree.setColumnWidth(0, max(_NAME_COLUMN_MIN, self.tree.viewport().width() - others))
+            finally:
+                self._fitting_columns = False
+
         def _screenshot_after_scan(self):
             forced = os.environ.get("HSI_FILTER")
             if forced:
@@ -3950,10 +4147,10 @@ def run_gui():
             def _grab():
                 if os.environ.get("HSI_COLTEST"):
                     header = self.tree.header()
-                    before = [self.tree.columnWidth(i) for i in range(5)]
+                    before = [self.tree.columnWidth(i) for i in range(self.tree.columnCount())]
                     # Simulates the drag.
                     header.resizeSection(1, before[1] + 120)
-                    after = [self.tree.columnWidth(i) for i in range(5)]
+                    after = [self.tree.columnWidth(i) for i in range(self.tree.columnCount())]
                     print("larghezze prima:", before, "dopo:", after, flush=True)
                 if os.environ.get("HSI_CLICKTEST"):
                     QTest.mouseClick(
@@ -3987,8 +4184,93 @@ def run_gui():
             self._names_lower = [m.name.lower() for m in self.matches]
             self._match_buckets = [bucket_of_kind(m.kind) for m in self.matches]
             self._match_langs = [self._lang_of(m) for m in self.matches]
+            self._build_tag_index()
             self._refresh_facets()
             self.apply_filter()
+
+        # ---------- tags
+
+        # A tag is a (group id, value id) pair: the selectors a wem sits under, the syncs an event sets,
+        # the values of a group row, the groups of a value row. Rendered with the names the scan resolved;
+        # the raw ids stay in the search text, so a number from another tool finds the same rows.
+        def _build_tag_index(self):
+            self._name_of = {}
+            self._group_of_value = defaultdict(set)
+            self._tags_lower = []
+            self._tag_text_of = {}
+            if self.index is None:
+                return
+            for m in self.matches:
+                self._name_of.setdefault(m.hash_id, m.name)
+            for group_id, values in self.index.group_values.items():
+                for value_id in values:
+                    self._group_of_value[value_id].add(group_id)
+            for m in self.matches:
+                tags = self._tags_of_match(m)
+                rendered = self._render_tags(tags)
+                self._tags_lower.append(self._tag_search_text(tags, rendered))
+                if rendered:
+                    self._tag_text_of[id(m)] = rendered
+
+        def _tags_of_match(self, m):
+            index = self.index
+            if m.kind in ("State group", "Switch group"):
+                return [(m.hash_id, value_id) for value_id in sorted(index.group_values.get(m.hash_id, ()))]
+            if m.kind in ("State", "Switch"):
+                return [(group_id, m.hash_id) for group_id in sorted(self._group_of_value.get(m.hash_id, ()))]
+            tags = set(index.event_tags.get(m.hash_id, ()))
+            for wid in m.wem_ids:
+                tags |= index.wem_tags.get(wid, set())
+            return sorted(tags)
+
+        def _wem_tag_text(self, wid):
+            if self.index is None:
+                return ""
+            return self._render_tags(sorted(self.index.wem_tags.get(wid, ())))
+
+        def _tags_of_item(self, item):
+            data = item.data(0, USER_ROLE)
+            if isinstance(data, NameMatch):
+                return self._tags_of_match(data)
+            if isinstance(data, WemLocation) and self.index is not None and item.text(2).isdigit():
+                return sorted(self.index.wem_tags.get(int(item.text(2)), ()))
+            return []
+
+        def _sync_label(self, sid):
+            return self._name_of.get(sid) or str(sid)
+
+        # "group=value|value; other_group=value": one entry per group, values joined.
+        def _render_tags(self, tags):
+            if not tags:
+                return ""
+            values_by_group = {}
+            for group_id, value_id in tags:
+                values_by_group.setdefault(group_id, [])
+                if value_id and value_id not in values_by_group[group_id]:
+                    values_by_group[group_id].append(value_id)
+            parts = []
+            for group_id, values in values_by_group.items():
+                label = self._sync_label(group_id)
+                if values:
+                    label += "=" + "|".join(self._sync_label(v) for v in values)
+                parts.append(label)
+            return "; ".join(parts)
+
+        @staticmethod
+        def _tag_search_text(tags, rendered):
+            if not tags:
+                return ""
+            ids = {str(i) for pair in tags for i in pair if i}
+            return rendered.lower() + " " + " ".join(sorted(ids))
+
+        def _tag_cell(self, item, text):
+            if not text:
+                return
+            if len(text) > _TAG_TEXT_LIMIT:
+                item.setText(5, text[: _TAG_TEXT_LIMIT - 1] + "…")
+                item.setToolTip(5, text.replace("; ", "\n"))
+            else:
+                item.setText(5, text)
 
         # First path segment: GI separates with backslash, SR and ZZZ with slash.
         @staticmethod
@@ -4046,7 +4328,16 @@ def run_gui():
             return self.active_bucket
 
         # Rebuilding beats hiding rows one by one: 0.1s vs 1.4s on 111k rows.
-        def rebuild_tree(self, matches, lookup_ids=None):
+        # An unnamed state/switch id typed in the search box gets a row of its own, like a wem or bnk id.
+        # Its wems come from the selectors, its tags say which values or groups it belongs with.
+        def _sync_lookup_match(self, sid):
+            kind = self.index.sync_ids[sid]
+            wems = sorted(self.index.sync_wems.get(sid, ()))
+            match = NameMatch(f"({kind.lower()} {sid})", kind, wems, sid)
+            self._tag_text_of[id(match)] = self._render_tags(self._tags_of_match(match))
+            return match
+
+        def rebuild_tree(self, matches, lookup_ids=None, sync_ids=None):
             _t0 = time.time()
             self.tree.setUpdatesEnabled(False)
             self._lookup_item = None
@@ -4058,9 +4349,11 @@ def run_gui():
                 locs = locations_for(self.index, lid)
                 if locs:
                     item = QTreeWidgetItem([f"(wem {lid})", "WEM", str(lid), "", f"{len(locs)} loc"])
+                    self._tag_cell(item, self._wem_tag_text(lid))
                     for loc in locs:
                         child = QTreeWidgetItem([loc.label(), "wem", str(lid), loc.lang, f"{loc.size:,}"])
                         child.setData(0, USER_ROLE, loc)
+                        self._tag_cell(child, self._wem_tag_text(lid))
                         item.addChild(child)
                 elif lid in self._wems_by_bnk:
                     wems = sorted(self._wems_by_bnk[lid])
@@ -4069,18 +4362,22 @@ def run_gui():
                         for loc in locations_for(self.index, wid):
                             child = QTreeWidgetItem([loc.label(), "wem", str(wid), loc.lang, f"{loc.size:,}"])
                             child.setData(0, USER_ROLE, loc)
+                            self._tag_cell(child, self._wem_tag_text(wid))
                             item.addChild(child)
                 else:
                     continue
                 items.append(item)
                 if self._lookup_item is None:
                     self._lookup_item = item
+            if sync_ids and self.index is not None:
+                matches = [self._sync_lookup_match(sid) for sid in sync_ids] + list(matches)
             for m in matches:
                 size_col = f"{len(m.wem_ids)} wems" if m.wem_ids else ""
                 item = QTreeWidgetItem([m.name, m.kind, str(m.hash_id),
                                         self._lang_of(m), size_col])
                 item.setIcon(0, self._type_icon(bucket_of_kind(m.kind)))
                 item.setData(0, USER_ROLE, m)
+                self._tag_cell(item, self._tag_text_of.get(id(m), ""))
                 if m.wem_ids:
                     item.addChild(QTreeWidgetItem(["..."]))
                 items.append(item)
@@ -4106,14 +4403,17 @@ def run_gui():
             item.takeChildren()
             for wid in m.wem_ids[:500]:
                 locs = locations_for(self.index, wid)
+                tag_text = self._wem_tag_text(wid)
                 if not locs:
                     child = QTreeWidgetItem(["(not found in pcks)", "wem", str(wid), "", ""])
+                    self._tag_cell(child, tag_text)
                     item.addChild(child)
                     continue
                 for loc in locs:
                     child = QTreeWidgetItem([
                         loc.label(), "wem", str(wid), loc.lang, f"{loc.size:,}"])
                     child.setData(0, USER_ROLE, loc)
+                    self._tag_cell(child, tag_text)
                     item.addChild(child)
             if len(m.wem_ids) > 500:
                 item.addChild(QTreeWidgetItem([f"... {len(m.wem_ids) - 500} more wems", "", "", "", ""]))
@@ -4147,11 +4447,17 @@ def run_gui():
                         pass
                     elif id_hits and not id_hits.isdisjoint(match.wem_ids):
                         pass
+                    elif text in self._tags_lower[i]:
+                        pass
                     else:
                         continue
                 subset.append(match)
             lookup = sorted(id_hits)[:_MAX_ID_LOOKUPS] if id_hits else []
-            self.rebuild_tree(subset, lookup_ids=lookup)
+            sync_lookup = []
+            if (as_id is not None and self.index is not None and as_id in self.index.sync_ids
+                    and as_id not in self._name_of):
+                sync_lookup = [as_id]
+            self.rebuild_tree(subset, lookup_ids=lookup, sync_ids=sync_lookup)
             if len(subset) != len(self.matches):
                 self.status_lbl.setText(f"{len(subset):,} of {len(self.matches):,} results shown")
 
@@ -4308,6 +4614,14 @@ def run_gui():
             menu.addAction("Copy BNK IDs").triggered.connect(self.copy_bnk_ids)
             menu.addAction("Copy name").triggered.connect(self.copy_names)
             menu.addAction("Copy row (tab separated)").triggered.connect(self.copy_rows)
+            # One entry per tag of the row: the search box gets the id, so the rows sharing it come up.
+            tags = self._tags_of_item(item) if item is not None else []
+            if tags:
+                menu.addSeparator()
+                for group_id, value_id in tags[:8]:
+                    action = menu.addAction(f"Search tag {self._render_tags([(group_id, value_id)])}")
+                    action.triggered.connect(
+                        lambda _checked=False, sid=value_id or group_id: self.filter_edit.setText(str(sid)))
             menu.exec(self.tree.viewport().mapToGlobal(pos))
 
         # ---------- playback / export
@@ -4474,7 +4788,7 @@ def run_gui():
                 QMessageBox.warning(self, APP_NAME, f"Export failed: {e}")
 
         def closeEvent(self, event):
-            self.cfg["column_widths_v2"] = [self.tree.columnWidth(i) for i in range(self.tree.columnCount())]
+            self.cfg["column_widths_v3"] = [self.tree.columnWidth(i) for i in range(self.tree.columnCount())]
             self.cfg["game"] = self.current_game()
             folders = dict(self.cfg.get("folders") or {})
             if self.folder_edit.text().strip():
