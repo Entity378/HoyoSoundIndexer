@@ -2675,8 +2675,11 @@ def resolve_online_voices(game, voice_paths, external_ids, progress=None):
 # Templates: the {} slot is refilled by crack_event_families with every known family filler.
 KNOWN_EVENT_TEMPLATES = ("play_vo_char_{}_charconfirm",)
 # Sync names the game code composes at runtime, recovered one by one by hand.
+# state_battle_speed is the HSR combat speed toggle: its Double_Speed branch holds the
+# sped-up copy of every battle VO, which reads as a bare 54353430 in the tag column until named.
 KNOWN_SYNC_NAMES = ("vo_charconfirm", "vo_charconfirm_yes", "vo_charconfirm_no",
-                    "shot1", "shot2", "state_crazytime", "farfromboss_state", "qte_state")
+                    "shot1", "shot2", "state_crazytime", "farfromboss_state", "qte_state",
+                    "state_battle_speed", "normal_speed", "double_speed", "none")
 
 
 # The whole naming pass shared by CLI and GUI, deduped at the end.
