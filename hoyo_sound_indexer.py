@@ -614,6 +614,12 @@ class ScanIndex:
         self.dialogue_trees = {}
         # SwitchCntr id -> (group type, group id, {switch value: child node ids}).
         self.switch_containers = {}
+        # Container object id -> the banks that define it. Only containers: a per-character
+        # subtree hangs off one, and its bank is the only place the character's name survives.
+        self.object_banks = defaultdict(set)
+        # Filled by label_characters once the names are resolved.
+        self.wem_characters = {}
+        self.character_banks = {}
         # Filled by build_sync_links once the hierarchy is complete.
         self.sync_wems = {}
         self.wem_tags = {}
@@ -937,6 +943,8 @@ def scan_folder(root, progress=None, cancel=None):
                         if parent and parent in index.object_ids:
                             index.parents[oid].add(parent)
                 elif otype in CONTAINER_TYPES:
+                    if meta.bkhd_id:
+                        index.object_banks[oid].add(meta.bkhd_id)
                     parent = parse_parent(raw, p, end, cont_variant)
                     if parent and parent in index.object_ids:
                         index.parents[oid].add(parent)
@@ -1182,11 +1190,43 @@ def _fnv32_feed(data, state=0x811C9DC5):
 
 _TAG_PREFIXES = ("State_", "StateGroup_", "BGM_", "Music_", "Switch_", "SwitchGroup_")
 
+# A group name wraps its subject in boilerplate: SwitchGroup_ in front, Type at the end,
+# often a domain word too (SwitchGroup_AvatarSwitchAidAttackType).
+_GROUP_WRAPPERS = ("switchgroup_", "stategroup_", "switch_", "state_")
+_GROUP_DOMAINS = ("avatarswitch", "avatar", "monster", "char", "vo")
+# Beyond this the per-group pass costs more than it returns; the groups with the most
+# unnamed values go first.
+_GROUP_PREFIX_BUDGET = 12
+
+
+# Its values are the subject glued to a bare identifier: SwitchGroup_AvatarSwitchAidAttackType
+# holds AidAttack_CommonAid, AidAttack_ParryAid... So the prefixes come from the group's own
+# name, peeled one layer at a time, and keep its casing.
+def group_value_prefixes(group_name):
+    stem = group_name
+    for wrapper in _GROUP_WRAPPERS:
+        if stem.lower().startswith(wrapper):
+            stem = stem[len(wrapper):]
+            break
+    stems = set()
+    for candidate in (stem, stem[:-4] if stem.lower().endswith("type") else ""):
+        if not candidate:
+            continue
+        stems.add(candidate)
+        for domain in _GROUP_DOMAINS:
+            if candidate.lower().startswith(domain):
+                rest = candidate[len(domain):].strip("_")
+                if rest:
+                    stems.add(rest)
+                    if rest.lower().endswith("type"):
+                        stems.add(rest[:-4])
+    return {stem + "_" for stem in stems if len(stem) > 2}
+
 
 # Unnamed sync ids get three extra passes: known prefixes glued to every candidate,
 # family slots refilled across the named syncs, and known stems with tail suffixes.
 # Names like BGM_Combat or SwitchGroup_C29_03 exist only as code-side concatenations.
-def crack_sync_names(index, candidates, matches):
+def crack_sync_names(index, candidates, matches, progress=None):
     matched_ids = {m.hash_id for m in matches}
     wanted = {sid for sid in index.sync_ids if sid not in matched_ids}
     if not wanted:
@@ -1197,11 +1237,41 @@ def crack_sync_names(index, candidates, matches):
         if h in wanted and h not in found:
             found[h] = name
 
+    # Encoded once: every prefix pass below walks the same list, and lower().encode()
+    # over a 700k candidate pool costs more than the hashing itself.
+    tails = [(candidate, candidate.lower().encode()) for candidate in candidates]
     prefix_states = [(prefix, _fnv32_feed(prefix.lower().encode())) for prefix in _TAG_PREFIXES]
-    for candidate in candidates:
-        tail = candidate.lower().encode()
+    for candidate, tail in tails:
         for prefix, state in prefix_states:
             take(prefix + candidate, _fnv32_feed(tail, state))
+
+    # Per-group pass. A prefix is only tried against its own group's values, so the
+    # handful of ids at risk of a 32-bit collision stays a handful, not the whole tag list.
+    # Only leaf-shaped candidates: what follows a group prefix is one bare identifier
+    # (AidAttack_CommonAid), and dropping the compound ones halves the pool for free.
+    leaves = [pair for pair in tails if "_" not in pair[0] and len(pair[0]) <= 40]
+    named_groups = {m.hash_id: m.name for m in matches
+                    if m.kind in ("Switch group", "State group")}
+    by_prefix = defaultdict(set)
+    ranked = sorted(index.group_values.items(),
+                    key=lambda kv: -len([v for v in kv[1] if v in wanted]))
+    for group_id, values in ranked:
+        group_name = named_groups.get(group_id)
+        targets = {v for v in values if v in wanted} if group_name else set()
+        if not targets:
+            continue
+        for prefix in group_value_prefixes(group_name):
+            if prefix not in by_prefix and len(by_prefix) >= _GROUP_PREFIX_BUDGET:
+                continue
+            by_prefix[prefix] |= targets
+    for done, (prefix, targets) in enumerate(by_prefix.items()):
+        if progress:
+            progress(done, len(by_prefix), f"Cracking {prefix}* tags ({len(found)} found)...")
+        state = _fnv32_feed(prefix.lower().encode())
+        for candidate, tail in leaves:
+            h = _fnv32_feed(tail, state)
+            if h in targets and h not in found:
+                found[h] = prefix + candidate
 
     sync_names = {m.name for m in matches if m.hash_id in index.sync_ids} | set(found.values())
     templates = defaultdict(set)
@@ -1237,6 +1307,8 @@ def crack_event_families(index, matches, progress=None):
     unresolved = (set(index.event_actions) | set(index.dialogue_children)) - set(known)
     if not unresolved or not known:
         return []
+    sync_fillers = {m.name.lower() for m in matches
+                    if m.kind in ("Switch", "State") and "_" not in m.name and len(m.name) <= 24}
     out = []
     for _round in range(2):
         names = set(known.values()) | {m.name for m in out}
@@ -1255,6 +1327,15 @@ def crack_event_families(index, matches, progress=None):
         for (prefix, _suffix), fillers in templates.items():
             if len(fillers) >= 4:
                 fillers_by_prefix[prefix] |= fillers
+        # A slot whose fillers are switch/state values is filled from that vocabulary, so the
+        # rest of it belongs there too: play_vo_char_<agent>_... reaches the agents that have
+        # no event of their own yet but do appear as a value of SwitchGroup_AvatarSwitchChar.
+        for prefix, fillers in fillers_by_prefix.items():
+            shared = fillers & sync_fillers
+            # Most of the slot has to come from that vocabulary: one shared word is a
+            # coincidence, and widening every slot costs more than the names it finds.
+            if len(shared) >= 4 and len(shared) * 2 >= len(fillers):
+                fillers |= sync_fillers
         done = 0
         for (prefix, suffix), fillers in templates.items():
             done += 1
@@ -1372,6 +1453,128 @@ def crack_context_names(index, matches):
                 if fnv1_32(candidate) == sid:
                     out.append(NameMatch(candidate, index.sync_ids.get(sid, "State"), [], sid))
                     break
+    return out
+
+
+# Wwise container ids are short ids, not name hashes, so the per-character subtree of the
+# combat VO carries no name of its own: the whole assist tree hangs off an anonymous node
+# and the only per-character events in it are a couple of reward lines. What the subtree does
+# carry is the bank it ships in, and that bank also holds that character's own named events.
+# That bank is the only bridge between an anonymous node and a name.
+_CHARACTER_EVENT_RES = (
+    re.compile(r"^play_vo_char_([a-z0-9]+)_"),
+    re.compile(r"^play_sfx_char_(?:foley|skill|impact)_([a-z0-9]+)_"),
+)
+# A node defined in more banks than this is shared plumbing, not one character's subtree.
+_CHARACTER_BANK_LIMIT = 8
+# Synthetic tag group: the character is not a game sync, it is what the bank tells us.
+CHARACTER_GROUP_NAME = "Character"
+CHARACTER_GROUP_ID = fnv1_32("HSI_" + CHARACTER_GROUP_NAME)
+
+
+# The slot the patterns capture also catches action words: Play_SFX_Char_Skill_ParryAid_...
+# looks exactly like a character. A real name stays in that slot, an action word turns up
+# again in the tail of other characters' events, so the tail count is what tells them apart.
+_CHARACTER_TAIL_RATIO = 2
+
+
+# Every named event split into (character slot, tail tokens).
+def _character_slots(matches):
+    slots, tails, casing = Counter(), Counter(), {}
+    for m in matches:
+        if m.kind not in ("Event", "DialogueEvent"):
+            continue
+        low = m.name.lower()
+        for pattern in _CHARACTER_EVENT_RES:
+            hit = pattern.match(low)
+            if not hit:
+                continue
+            token = hit.group(1)
+            slots[token] += 1
+            # The original casing, sliced back out of the event name.
+            original = m.name[hit.start(1):hit.end(1)]
+            best = casing.get(token)
+            if best is None or sum(c.isupper() for c in original) > sum(c.isupper() for c in best):
+                casing[token] = original
+            for tail in low[hit.end():].split("_"):
+                if tail:
+                    tails[tail] += 1
+            break
+    vocabulary = {token: casing[token] for token, count in slots.items()
+                  if tails[token] <= _CHARACTER_TAIL_RATIO * count}
+    return vocabulary
+
+
+# bank id -> character name, voted by the named events the bank defines.
+# A bank naming two characters names neither: it is shared content, not one character's.
+def _characters_by_bank(index, matches):
+    vocabulary = _character_slots(matches)
+    if not vocabulary:
+        return {}
+    name_of = {m.hash_id: m.name for m in matches if m.kind in ("Event", "DialogueEvent")}
+    bank_tokens = defaultdict(set)
+    for event_id, banks in index.event_banks.items():
+        name = name_of.get(event_id)
+        if not name:
+            continue
+        low = name.lower()
+        for pattern in _CHARACTER_EVENT_RES:
+            hit = pattern.match(low)
+            if hit and hit.group(1) in vocabulary:
+                for bank in banks:
+                    bank_tokens[bank].add(hit.group(1))
+                break
+    return {bank: vocabulary[next(iter(tokens))]
+            for bank, tokens in bank_tokens.items() if len(tokens) == 1}
+
+
+# The character of a wem is the one of the nearest ancestor that lives in few enough banks
+# to be private to it. Ancestors are walked upward, so a shared root never wins over a subtree.
+def label_characters(index, matches):
+    by_bank = _characters_by_bank(index, matches)
+    if not by_bank:
+        return []
+    nodes_of_wem = defaultdict(set)
+    for node, srcs in index.node_srcs.items():
+        for wid in srcs:
+            nodes_of_wem[wid].add(node)
+    characters = {}
+    for wid, nodes in nodes_of_wem.items():
+        found = None
+        for node in nodes:
+            cur = node
+            for _ in range(32):
+                banks = index.object_banks.get(cur)
+                if banks and len(banks) <= _CHARACTER_BANK_LIMIT:
+                    tokens = {by_bank[b] for b in banks if b in by_bank}
+                    if len(tokens) == 1:
+                        found = next(iter(tokens))
+                        break
+                parents = index.parents.get(cur)
+                if not parents:
+                    break
+                cur = next(iter(parents))
+            if found:
+                break
+        if found:
+            characters[wid] = found
+    index.character_banks = by_bank
+    index.wem_characters = characters
+    if not characters:
+        return []
+    values = {}
+    for wid, token in characters.items():
+        value_id = fnv1_32(token)
+        values.setdefault(value_id, token)
+        index.wem_tags.setdefault(wid, set()).add((CHARACTER_GROUP_ID, value_id))
+    index.group_values.setdefault(CHARACTER_GROUP_ID, set()).update(values)
+    index.sync_ids.setdefault(CHARACTER_GROUP_ID, "Switch group")
+    named = {m.hash_id for m in matches}
+    out = [NameMatch(CHARACTER_GROUP_NAME, "Switch group", [], CHARACTER_GROUP_ID)]
+    for value_id, token in values.items():
+        index.sync_ids.setdefault(value_id, "Switch")
+        if value_id not in named:
+            out.append(NameMatch(token, "Switch", [], value_id))
     return out
 
 
@@ -2703,7 +2906,7 @@ def resolve_all_matches(index, names, scan_root, names_path=None, vo_data=None,
         if crack:
             if progress:
                 progress(0, 1, "Cracking unnamed tags...")
-            cracked = crack_sync_names(index, state_names, matches)
+            cracked = crack_sync_names(index, state_names, matches, progress=progress)
             matches.extend(cracked)
             counts["cracked_tags"] = len(cracked)
     matches = apply_exported_matches(names_path, index, matches)
@@ -2736,6 +2939,9 @@ def resolve_all_matches(index, names, scan_root, names_path=None, vo_data=None,
     branches = music_branch_matches(index, matches)
     matches.extend(branches)
     counts["music_branches"] = len(branches)
+    character_matches = label_characters(index, matches)
+    matches.extend(character_matches)
+    counts["characters"] = len(index.wem_characters)
     attach_sync_wems(index, matches)
     matches = dedupe_matches(matches)
     return matches, prune_unmatched(matches, unmatched), counts
@@ -2829,6 +3035,9 @@ def run_cli(args):
         print(f"  audio labels applied: {counts['labels']} (MusicSegment & co.)")
     if counts.get("music_branches"):
         print(f"  music branches labeled: {counts['music_branches']}")
+    if counts.get("characters"):
+        print(f"  wems tagged with a character: {counts['characters']} "
+              f"({len(set(index.wem_characters.values()))} characters, from their banks)")
 
     if matches or names:
         by_kind = defaultdict(int)
