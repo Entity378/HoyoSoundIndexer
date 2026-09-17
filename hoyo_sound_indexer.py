@@ -1300,9 +1300,68 @@ def crack_sync_names(index, candidates, matches, progress=None):
     return [NameMatch(name, index.sync_ids.get(h, "State"), [], h) for h, name in found.items()]
 
 
+# A family's suffix vocabulary is only what some resolved name already spells out, so an action
+# no member has a named event for stays invisible: ZZZ hides battleswitch, qtestart and the
+# encounter lines exactly there. The harvested identifiers do carry those words, on their own or
+# as the tail of a longer one (Play_vo_char_oshint -> oshint), so gluing them to a family head
+# brings the missing members back.
+# Digits are dropped: a numbered variant of a known stem is what the tails pass already covers.
+_FAMILY_SUFFIX_MAXLEN = 32
+# Probing costs one pass over the candidates per (prefix, filler) pair.
+_FAMILY_SUFFIX_PREFIXES = 5
+_FAMILY_SUFFIX_PROBES = 4
+
+
+# Every candidate and every underscore tail of it, deduped on the lowercase the hash sees.
+def suffix_candidates(candidates):
+    out = {}
+    for name in candidates:
+        parts = name.split("_")
+        for i in range(len(parts)):
+            tail = "_".join(parts[i:])
+            if 2 < len(tail) <= _FAMILY_SUFFIX_MAXLEN and not any(c.isdigit() for c in tail):
+                out.setdefault(tail.lower(), tail)
+    return list(out.values())
+
+
+# Suffixes that hash into the unresolved events under a family head. Two different fillers have
+# to agree, or a 32-bit collision invents one: on ZZZ that guard drops 36 candidates and keeps 9.
+def discover_family_suffixes(templates, ranked_prefixes, unresolved, candidates, progress=None):
+    if not candidates or not unresolved:
+        return {}
+    probes = []
+    for prefix in ranked_prefixes[:_FAMILY_SUFFIX_PREFIXES]:
+        if prefix.count("_") < 1:
+            continue
+        seen = Counter()
+        for (other, _suffix), members in templates.items():
+            if other == prefix:
+                seen.update(members)
+        picked = [filler for filler, _n in seen.most_common(_FAMILY_SUFFIX_PROBES)]
+        if len(picked) >= 2:
+            probes.append((prefix, picked))
+    if not probes:
+        return {}
+    tails = [(tail, tail.lower().encode()) for tail in suffix_candidates(candidates)]
+    found = defaultdict(lambda: defaultdict(set))
+    done = 0
+    for prefix, picked in probes:
+        for filler in picked:
+            done += 1
+            if progress:
+                progress(done, len(probes) * _FAMILY_SUFFIX_PROBES,
+                         f"Probing {prefix}_{filler}_* for new suffixes...")
+            state = _fnv32_feed(f"{prefix}_{filler}_".encode())
+            for tail, encoded in tails:
+                if _fnv32_feed(encoded, state) in unresolved:
+                    found[prefix][tail.lower()].add(filler)
+    return {prefix: {tail for tail, agreed in tails_found.items() if len(agreed) >= 2}
+            for prefix, tails_found in found.items()}
+
+
 # Matched event names crack their missing family members: the varying token is refilled
 # with every filler already seen on the same prefix, and verified by hash as always.
-def crack_event_families(index, matches, progress=None):
+def crack_event_families(index, matches, progress=None, candidates=()):
     known = {m.hash_id: m.name for m in matches if m.kind in ("Event", "DialogueEvent")}
     unresolved = (set(index.event_actions) | set(index.dialogue_children)) - set(known)
     if not unresolved or not known:
@@ -1327,6 +1386,14 @@ def crack_event_families(index, matches, progress=None):
         for (prefix, _suffix), fillers in templates.items():
             if len(fillers) >= 4:
                 fillers_by_prefix[prefix] |= fillers
+        # Which families enumerate an entity (agents, monsters) rather than just sharing a head:
+        # their slot is refilled the same way across many suffixes. Counting the fillers of the
+        # well-populated suffixes alone separates them from a prefix with one crowded suffix.
+        strength = defaultdict(int)
+        for (prefix, _suffix), fillers in templates.items():
+            if len(fillers) >= 8:
+                strength[prefix] += len(fillers)
+        ranked_prefixes = [prefix for prefix, _n in sorted(strength.items(), key=lambda kv: -kv[1])]
         # A slot whose fillers are switch/state values is filled from that vocabulary, so the
         # rest of it belongs there too: play_vo_char_<agent>_... reaches the agents that have
         # no event of their own yet but do appear as a value of SwitchGroup_AvatarSwitchChar.
@@ -1336,6 +1403,13 @@ def crack_event_families(index, matches, progress=None):
             # coincidence, and widening every slot costs more than the names it finds.
             if len(shared) >= 4 and len(shared) * 2 >= len(fillers):
                 fillers |= sync_fillers
+        # Round two rebuilds the templates around whatever round one found, the discovered
+        # suffixes among them, so the probing only has to happen once.
+        if not _round:
+            for prefix, suffixes in discover_family_suffixes(
+                    templates, ranked_prefixes, unresolved, candidates, progress).items():
+                for suffix in suffixes:
+                    templates.setdefault((prefix, suffix), set())
         done = 0
         for (prefix, suffix), fillers in templates.items():
             done += 1
@@ -2951,7 +3025,8 @@ def resolve_all_matches(index, names, scan_root, names_path=None, vo_data=None,
             matches.append(NameMatch(label_name, category, wems, oid))
         counts["labels"] = len(labels)
     if crack:
-        family_matches = crack_event_families(index, matches, progress=progress)
+        family_matches = crack_event_families(index, matches, progress=progress,
+                                              candidates=state_names)
         matches.extend(family_matches)
         counts["family_events"] = len(family_matches)
         if progress:
