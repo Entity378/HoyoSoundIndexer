@@ -2338,6 +2338,29 @@ TYPE_BUCKETS = (("all", "All"), ("voice", "Voice"), ("event", "Event"),
                 ("music", "Music"), ("bank", "Bank"), ("sync", "State / other"))
 
 
+# A wem a group routes to on nearly every one of its values renders as a wall of names:
+# ZZZ gives 68 of the 71 partners the same generic assist line. Past this share the cell shows
+# what does NOT select it, which is the part that carries the information.
+TAG_COLLAPSE_MIN_VALUES = 8
+TAG_COLLAPSE_SHARE = 0.75
+TAG_COLLAPSE_MAX_REST = 5
+
+
+# (mode, ids): "none" prints the values as they are, "all" prints none of them,
+# "except" prints the few that are missing, "partial" only counts them.
+def collapse_tag_values(values, known):
+    known = [v for v in known if v]
+    picked = set(values)
+    if len(known) < TAG_COLLAPSE_MIN_VALUES or len(picked) < len(known) * TAG_COLLAPSE_SHARE:
+        return "none", values
+    rest = [v for v in known if v not in picked]
+    if not rest:
+        return "all", []
+    if len(rest) <= TAG_COLLAPSE_MAX_REST:
+        return "except", rest
+    return "partial", rest
+
+
 def bucket_of_kind(kind):
     if kind == "External":
         return "voice"
@@ -4419,10 +4442,16 @@ def run_gui():
                     self._group_of_value[value_id].add(group_id)
             for m in self.matches:
                 tags = self._tags_of_match(m)
-                rendered = self._render_tags(tags)
-                self._tags_lower.append(self._tag_search_text(tags, rendered))
+                rendered = self._match_tag_text(m, tags)
+                self._tags_lower.append(
+                    self._tag_search_text(tags, self._render_tags(tags, collapse=False)))
                 if rendered:
                     self._tag_text_of[id(m)] = rendered
+
+        # A group row lists its own values: that list is the row's content, never collapsed.
+        def _match_tag_text(self, m, tags=None):
+            tags = self._tags_of_match(m) if tags is None else tags
+            return self._render_tags(tags, collapse=m.kind not in ("State group", "Switch group"))
 
         def _tags_of_match(self, m):
             index = self.index
@@ -4452,7 +4481,9 @@ def run_gui():
             return self._name_of.get(sid) or str(sid)
 
         # "group=value|value; other_group=value": one entry per group, values joined.
-        def _render_tags(self, tags):
+        # With collapse off every value is spelled out: that is what the search text indexes,
+        # so a name the cell hides still finds its row.
+        def _render_tags(self, tags, collapse=True):
             if not tags:
                 return ""
             values_by_group = {}
@@ -4463,7 +4494,16 @@ def run_gui():
             parts = []
             for group_id, values in values_by_group.items():
                 label = self._sync_label(group_id)
-                if values:
+                mode, shown = "none", values
+                if collapse and values and self.index is not None:
+                    mode, shown = collapse_tag_values(values, self.index.group_values.get(group_id, ()))
+                if mode == "all":
+                    label += "=*"
+                elif mode == "except":
+                    label += "=* except " + "|".join(self._sync_label(v) for v in shown)
+                elif mode == "partial":
+                    label += f"=* ({len(values)} of {len(values) + len(shown)})"
+                elif values:
                     label += "=" + "|".join(self._sync_label(v) for v in values)
                 parts.append(label)
             return "; ".join(parts)
@@ -4546,7 +4586,7 @@ def run_gui():
             kind = self.index.sync_ids[sid]
             wems = sorted(self.index.sync_wems.get(sid, ()))
             match = NameMatch(f"({kind.lower()} {sid})", kind, wems, sid)
-            self._tag_text_of[id(match)] = self._render_tags(self._tags_of_match(match))
+            self._tag_text_of[id(match)] = self._match_tag_text(match)
             return match
 
         def rebuild_tree(self, matches, lookup_ids=None, sync_ids=None):
