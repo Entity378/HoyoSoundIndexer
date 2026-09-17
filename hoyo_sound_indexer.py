@@ -1310,6 +1310,15 @@ _FAMILY_SUFFIX_MAXLEN = 32
 # Probing costs one pass over the candidates per (prefix, filler) pair.
 _FAMILY_SUFFIX_PREFIXES = 5
 _FAMILY_SUFFIX_PROBES = 4
+# The strongest family is probed with every filler instead: a suffix three members out of sixty
+# share (play_vo_char_anbi_followattack) is never in a four-filler sample, whatever it samples.
+_FAMILY_SUFFIX_FULL_PREFIXES = 1
+
+
+# Returns every truncation of a suffix: attackbranch_a_charge_end -> attackbranch_a_charge, ...
+def _suffix_stems(suffix):
+    parts = suffix.split("_")
+    return ["_".join(parts[:i]) for i in range(1, len(parts))]
 
 
 # Every candidate and every underscore tail of it, deduped on the lowercase the hash sees.
@@ -1324,39 +1333,74 @@ def suffix_candidates(candidates):
     return list(out.values())
 
 
-# Suffixes that hash into the unresolved events under a family head. Two different fillers have
-# to agree, or a 32-bit collision invents one: on ZZZ that guard drops 36 candidates and keeps 9.
+# Returns prefix -> the suffixes its family uses that no resolved name spells out yet.
+# A few fillers are probed against the whole candidate pool, then every hit is replayed over
+# the family's full filler list: two different fillers have to land on it, or a 32-bit collision
+# invents one. Replaying is what saves the rare suffixes, the ones only three agents have.
 def discover_family_suffixes(templates, ranked_prefixes, unresolved, candidates, progress=None):
     if not candidates or not unresolved:
         return {}
     probes = []
-    for prefix in ranked_prefixes[:_FAMILY_SUFFIX_PREFIXES]:
+    for rank, prefix in enumerate(ranked_prefixes[:_FAMILY_SUFFIX_PREFIXES]):
         if prefix.count("_") < 1:
             continue
         seen = Counter()
         for (other, _suffix), members in templates.items():
             if other == prefix:
                 seen.update(members)
-        picked = [filler for filler, _n in seen.most_common(_FAMILY_SUFFIX_PROBES)]
+        if rank < _FAMILY_SUFFIX_FULL_PREFIXES:
+            picked = sorted(seen)
+        else:
+            picked = [filler for filler, _n in seen.most_common(_FAMILY_SUFFIX_PROBES)]
         if len(picked) >= 2:
-            probes.append((prefix, picked))
+            probes.append((prefix, picked, set(seen)))
+    total_probes = sum(len(picked) for _prefix, picked, _fillers in probes)
     if not probes:
         return {}
     tails = [(tail, tail.lower().encode()) for tail in suffix_candidates(candidates)]
-    found = defaultdict(lambda: defaultdict(set))
+    known_suffixes = defaultdict(set)
+    for prefix, suffix in templates:
+        known_suffixes[prefix].add(suffix)
+    out = {}
     done = 0
-    for prefix, picked in probes:
+    for prefix, picked, fillers in probes:
+        seen_tails = set()
         for filler in picked:
             done += 1
             if progress:
-                progress(done, len(probes) * _FAMILY_SUFFIX_PROBES,
+                progress(done, total_probes,
                          f"Probing {prefix}_{filler}_* for new suffixes...")
             state = _fnv32_feed(f"{prefix}_{filler}_".encode())
             for tail, encoded in tails:
                 if _fnv32_feed(encoded, state) in unresolved:
-                    found[prefix][tail.lower()].add(filler)
-    return {prefix: {tail for tail, agreed in tails_found.items() if len(agreed) >= 2}
-            for prefix, tails_found in found.items()}
+                    seen_tails.add(tail.lower())
+        confirmed = set()
+        # A suffix the family truncates: aokaku has attackbranch_a_charge_end resolved but not
+        # attackbranch_a_charge, and refilling the slot never shortens the tail. One filler is
+        # enough here, and only the filler that owns the longer suffix: a couple of thousand
+        # guesses against one head cannot realistically collide, unlike a 200k pool.
+        for suffix in known_suffixes[prefix]:
+            owners = templates.get((prefix, suffix), ())
+            for stem in _suffix_stems(suffix):
+                if stem in known_suffixes[prefix] or stem in confirmed:
+                    continue
+                encoded = stem.encode()
+                for filler in owners:
+                    if _fnv32_feed(encoded, _fnv32_feed(f"{prefix}_{filler}_".encode())) in unresolved:
+                        confirmed.add(stem)
+                        break
+        for tail in seen_tails:
+            encoded = tail.encode()
+            agreed = 0
+            for filler in fillers:
+                state = _fnv32_feed(f"{prefix}_{filler}_".encode())
+                if _fnv32_feed(encoded, state) in unresolved:
+                    agreed += 1
+                    if agreed >= 2:
+                        confirmed.add(tail)
+                        break
+        out[prefix] = confirmed
+    return out
 
 
 # Matched event names crack their missing family members: the varying token is refilled
@@ -1552,7 +1596,8 @@ CHARACTER_GROUP_ID = fnv1_32("HSI_" + CHARACTER_GROUP_NAME)
 _CHARACTER_TAIL_RATIO = 2
 
 
-# Every named event split into (character slot, tail tokens).
+# Returns token -> character name, keeping the best casing the event names spell it with.
+# A token is kept only when the character slot is where it mostly lives.
 def _character_slots(matches):
     slots, tails, casing = Counter(), Counter(), {}
     for m in matches:
@@ -1602,8 +1647,9 @@ def _characters_by_bank(index, matches):
             for bank, tokens in bank_tokens.items() if len(tokens) == 1}
 
 
-# The character of a wem is the one of the nearest ancestor that lives in few enough banks
-# to be private to it. Ancestors are walked upward, so a shared root never wins over a subtree.
+# Fills index.wem_characters and returns the matches that name the synthetic tag group and its
+# values. The character of a wem is the one of the nearest ancestor living in few enough banks
+# to be private to it; ancestors are walked upward, so a shared root never wins over a subtree.
 def label_characters(index, matches):
     by_bank = _characters_by_bank(index, matches)
     if not by_bank:
