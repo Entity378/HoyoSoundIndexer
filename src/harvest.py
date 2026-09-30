@@ -4,10 +4,12 @@ import os
 import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from blkdec import iter_blk_blocks
 
+from src.config import read_cache, write_cache
 from src.games import GAME_PROFILES, ZZZ_DATA_BLOCK_DIRS, persistent_twins
 from src.vocabulary import DEFAULT_HARVEST_PREFIXES, HARVEST_PREFIXES_BY_GAME
 from src.voice.from_harvest import HarvestedVoice
@@ -23,6 +25,7 @@ _PROGRESS_EVERY_FILES = 5
 _ISOLATED_NUL_RE = re.compile(rb"(?<=[\x01-\xff])\x00(?=[\x01-\xff])")
 # Any identifier, since state and switch names have no fixed prefix.
 IDENTIFIER_RE = re.compile(rb"[A-Za-z][A-Za-z0-9_]{2,79}")
+CACHE_KIND = "harvest"
 
 
 @dataclass
@@ -30,6 +33,23 @@ class HarvestResult:
     names: list = field(default_factory=list)
     voice: HarvestedVoice = field(default_factory=HarvestedVoice)
     cancelled: bool = False
+    # When the harvest ran, which tells a saved harvest from a fresh one.
+    harvested: str = ""
+
+
+# The last harvest of each game, which takes minutes to redo and changes only with a game update.
+# Its voice keys are those of a saved voice data file, so --vo-in reads it as well.
+def save_harvest(game, folder, result):
+    return write_cache(CACHE_KIND, game, {"harvested": result.harvested, "folder": str(folder),
+                                          "names": result.names, **result.voice.to_json()})
+
+
+def load_saved_harvest(game):
+    doc = read_cache(CACHE_KIND, game)
+    if doc is None or not isinstance(doc.get("names"), list):
+        return None
+    return HarvestResult(names=[name for name in doc["names"] if isinstance(name, str)],
+                         voice=HarvestedVoice.from_json(doc), harvested=doc.get("harvested", ""))
 
 
 def default_harvest_prefixes(game):
@@ -134,7 +154,7 @@ def harvest_folder(folder, prefixes, progress=None, cancel=None, game=None):
     if progress:
         progress(len(files), len(files), "Harvest cancelled" if cancelled else "Harvest done")
     return HarvestResult(sorted(names), HarvestedVoice(sorted(voice_prefixes), sorted(voice_sources)),
-                         cancelled)
+                         cancelled, datetime.now().strftime("%Y-%m-%d %H:%M"))
 
 
 # The il2cpp metadata holds the C# string literals, plaintext on ZZZ, where code-set state names live.

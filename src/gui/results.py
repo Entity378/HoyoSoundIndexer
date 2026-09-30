@@ -136,6 +136,7 @@ class TagRenderer:
         return self.render(tags, collapse=False).lower() + " " + " ".join(sorted(ids))
 
 
+# size adds up the biggest copy of each wem, and duration is the longest wem's, -1 when none is known.
 @dataclass(eq=False, slots=True)
 class ResultRow:
     match: NameMatch
@@ -146,6 +147,19 @@ class ResultRow:
     action: str = ""
     tag_text: str = ""
     tag_search: str = ""
+    size: int = 0
+    duration: int = -1
+
+
+# Wem id -> the size of its biggest copy, the one playback and export use.
+def _biggest_sizes(index):
+    sizes = {}
+    for table in (index.wem_locations, index.external_locations):
+        for wem_id, locations in table.items():
+            biggest = max(location.size for location in locations)
+            if biggest > sizes.get(wem_id, 0):
+                sizes[wem_id] = biggest
+    return sizes
 
 
 # lookups are the wem and bank ids matching a typed number, sync_rows a typed sync id nothing names.
@@ -162,6 +176,7 @@ class ResultModel:
         self.matches = matches
         self.tags = TagRenderer(index, matches)
         self.aliases = dict(index.avatar_names)
+        self.wem_sizes = _biggest_sizes(index)
         self.rows = [self._row(m) for m in matches]
         # The rows of each bucket and character in list order, so a filter on either walks only those.
         self.rows_by_bucket = defaultdict(list)
@@ -181,7 +196,15 @@ class ResultModel:
                          language=language_of_match(m),
                          character=character_of_match(self.index, m, self.aliases),
                          action=action_of_match(m), tag_text=self.tags.match_text(m, tags),
-                         tag_search=self.tags.search_text(tags))
+                         tag_search=self.tags.search_text(tags), size=self.size_of(m.wem_ids),
+                         duration=self.duration_of(m.wem_ids))
+
+    def size_of(self, wem_ids):
+        return sum(self.wem_sizes.get(wem_id, 0) for wem_id in wem_ids)
+
+    def duration_of(self, wem_ids):
+        durations = self.index.wem_durations
+        return max((durations.get(wem_id, -1) for wem_id in wem_ids), default=-1)
 
     # Every wem and bank id as text, so the search box can match a piece of a number.
     def _build_id_lookup(self):
@@ -230,7 +253,8 @@ class ResultModel:
         m = NameMatch(f"({kind.lower()} {sync_id})", kind, sorted(self.index.sync_wems.get(sync_id, ())),
                       sync_id)
         return ResultRow(match=m, name_lower=m.name.lower(), bucket=bucket_of_match(m), language="",
-                         tag_text=self.tags.match_text(m))
+                         tag_text=self.tags.match_text(m), size=self.size_of(m.wem_ids),
+                         duration=self.duration_of(m.wem_ids))
 
     # The wems only the character's tag reaches, so the list really is everything of that character.
     def tagged_row(self, character, rows):
@@ -239,7 +263,8 @@ class ResultModel:
         if not rest:
             return None
         m = NameMatch(TAGGED_ROW_LABEL, Kind.TAGGED, rest, CHARACTER_GROUP_ID)
-        return ResultRow(match=m, name_lower=m.name.lower(), bucket=bucket_of_match(m), language="")
+        return ResultRow(match=m, name_lower=m.name.lower(), bucket=bucket_of_match(m), language="",
+                         size=self.size_of(rest), duration=self.duration_of(rest))
 
     def bucket_counts(self):
         return Counter(row.bucket for row in self.rows)

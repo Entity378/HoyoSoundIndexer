@@ -186,6 +186,17 @@ def media_icon(kind, color):
         painter.drawRoundedRect(QRectF(9, 1, 4, 13), 1, 1)
     elif kind == "stop":
         painter.drawRoundedRect(QRectF(1, 1, 13, 13), 1, 1)
+    elif kind in ("previous", "next"):
+        if kind == "previous":
+            painter.translate(size, 0)
+            painter.scale(-1, 1)
+        path = QPainterPath()
+        path.moveTo(1.5, 1.5)
+        path.lineTo(10.5, size / 2)
+        path.lineTo(1.5, size - 1.5)
+        path.closeSubpath()
+        painter.drawPath(path)
+        painter.drawRoundedRect(QRectF(10.5, 1.5, 3, 12), 0.8, 0.8)
     painter.end()
     return QIcon(pixmap)
 

@@ -18,8 +18,34 @@ def config_file():
     return config_dir() / "config.json"
 
 
+def cache_file(kind, game):
+    return config_dir() / "cache" / f"{kind}_{game}.json"
+
+
 def online_cache_file(game):
-    return config_dir() / "cache" / f"voice_{game}.json"
+    return cache_file("voice", game)
+
+
+# None when missing or unreadable, which every caller treats as no cache.
+def read_cache(kind, game):
+    try:
+        doc = json.loads(cache_file(kind, game).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+# Written aside and swapped in, so a crash mid-write never leaves half a cache behind.
+def write_cache(kind, game, doc):
+    path = cache_file(kind, game)
+    temp = path.with_suffix(".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp.write_text(json.dumps(doc, separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
+        temp.replace(path)
+    except OSError:
+        return False
+    return True
 
 
 def tools_dir():

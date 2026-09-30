@@ -58,22 +58,24 @@ class ExportedNames:
             return None
         return cls(doc) if isinstance(doc, dict) else None
 
+    # (name, kind, id) of every saved row, in file order.
+    def entries(self):
+        for section, fixed_kind in EXPORT_SECTIONS:
+            for entry in self.doc.get(section, []):
+                if isinstance(entry, dict):
+                    kind = fixed_kind or entry.get("type") or entry.get("kind")
+                    yield entry.get("name"), kind, entry.get("id")
+
     # Rows are rebuilt from their saved ids, since labels like GI's music segments are not name hashes.
     # Music branches are rebuilt from the restored state names instead, with every wem of the branch.
     def matches(self, index):
         restored = []
-        for section, fixed_kind in EXPORT_SECTIONS:
-            for entry in self.doc.get(section, []):
-                if not isinstance(entry, dict):
-                    continue
-                name = entry.get("name")
-                oid = entry.get("id")
-                kind = fixed_kind or entry.get("type") or entry.get("kind")
-                if not name or not kind or not isinstance(oid, int) or kind == Kind.MUSIC_BRANCH:
-                    continue
-                wems = _restored_wems(index, kind, oid)
-                if wems is not None:
-                    restored.append(NameMatch(name, kind, wems, oid))
+        for name, kind, oid in self.entries():
+            if not name or not kind or not isinstance(oid, int) or kind == Kind.MUSIC_BRANCH:
+                continue
+            wems = _restored_wems(index, kind, oid)
+            if wems is not None:
+                restored.append(NameMatch(name, kind, wems, oid))
         return restored
 
     def avatar_names(self):

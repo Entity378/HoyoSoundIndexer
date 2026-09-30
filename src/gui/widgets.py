@@ -17,6 +17,30 @@ def format_ms(ms):
     return f"{seconds // 60}:{seconds % 60:02d}"
 
 
+def format_count(count):
+    return f"{count:,}" if count > 0 else ""
+
+
+# Binary units, the way Windows Explorer counts them.
+def format_size(size):
+    if size <= 0:
+        return ""
+    if size < 1024:
+        return f"{size} B"
+    for unit in ("KB", "MB", "GB"):
+        size /= 1024
+        if size < 1024 or unit == "GB":
+            return f"{size:.1f} {unit}"
+
+
+# Tenths of a second, since most sound effects last less than one.
+def format_duration(ms):
+    if ms < 0:
+        return ""
+    minutes, tenths = divmod(ms // 100, 600)
+    return f"{minutes}:{tenths // 10:02d}.{tenths % 10}"
+
+
 def rail_header(text):
     label = QLabel(text)
     label.setObjectName("railHeader")

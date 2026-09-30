@@ -43,6 +43,8 @@ class ScanIndex:
         self.character_banks = {}
         # Every spelling of a character met by the resolve -> the name shown for it.
         self.avatar_names = {}
+        # Wem id -> milliseconds, filled by read_durations for the GUI.
+        self.wem_durations = {}
 
         self.stats = defaultdict(int)
 

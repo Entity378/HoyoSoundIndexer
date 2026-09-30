@@ -3,6 +3,7 @@
 import os
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QAction, QKeySequence
@@ -13,11 +14,13 @@ from PyQt6.QtWidgets import (
 
 from src.audio import export_wems, extract_wem_bytes
 from src.config import APP_NAME, load_config, save_config
+from src.durations import read_durations
 from src.games import DEFAULT_GAME, GAME_ORDER, GAME_PROFILES, detect_game_from_path, locate_game_folder
 from src.names_io import export_json, export_txt, read_names_file
 from src.online.data import has_online_cache, load_online_data, read_online_cache
 from src.online.sources import source_for, source_short_name
 from src.pipeline import Cancelled, resolve_all_matches
+from src.resolve_cache import load_saved_resolve, resolve_key, restore_resolve, save_resolve
 from src.scan import scan_folder
 from src.gui import test_hooks
 from src.gui.filter_rail import FilterRail
@@ -32,18 +35,31 @@ from src.gui.widgets import SourceBox
 _WINDOW_SIZE = (1180, 760)
 _DEFAULT_VOLUME = 80
 _FILTER_DELAY_MS = 250
+# Long enough that holding an arrow key converts only the row it stops on.
+_AUTOPLAY_DELAY_MS = 180
 _EXPORT_CONFIRM_FILES = 500
 _CLOSE_WAIT_SECONDS = 3
 _MENU_TAGS = 8
 _FOLDER_PLACEHOLDER = "game root folder works too — pck files are found recursively (Persistent included)"
 _SEARCH_PLACEHOLDER = "search by name, by tag (state/switch name or id) or by ID — event/bank/wem id"
-_CRACK_TOOLTIP = ("Deep name cracking (~45s per scan): harvest, tags, event families, context.\n"
-                  "Run it once, save with Export names..., load that JSON as Names file,\n"
-                  "then untick to get the same names back instantly on every scan.")
+_CRACK_TOOLTIP = ("Deep name cracking (a minute or two): tags, event families, context.\n"
+                  "The result is saved per game and comes back in seconds on the next scans,\n"
+                  "until the game files, the name sources or the tool change.")
+_PLAY_TOOLTIP = "Play or pause the selection (Space).\nEnter or a double click plays it from the start."
+_AUTOPLAY_TOOLTIP = "Play each row as it gets selected, so the arrow keys browse the sounds"
+
+
+# restored is the date of the cracked names brought back from the cache, empty when resolved now.
+class ScanOutcome(NamedTuple):
+    index: object
+    result: object
+    model: object
+    restored: str
 
 
 # Runs in the scan task, which also reads the names file there, once: an export runs to 200 MB.
-def _scan_and_resolve(folder, names_path, extra_names, online, harvested_voice, crack, progress, cancelled):
+def _scan_and_resolve(game, folder, names_path, extra_names, online, harvested_voice, crack, progress,
+                      cancelled):
     names, export = [], None
     if names_path:
         try:
@@ -54,11 +70,25 @@ def _scan_and_resolve(folder, names_path, extra_names, online, harvested_voice, 
     index = scan_folder(folder, progress=progress, cancel=cancelled)
     if cancelled():
         raise Cancelled()
-    result = resolve_all_matches(index, names, folder, export=export, online=online,
-                                 harvested_voice=harvested_voice, progress=progress, cancel=cancelled,
-                                 crack=crack)
+    index.wem_durations = read_durations(index, game, progress=progress, cancel=cancelled)
+    if cancelled():
+        raise Cancelled()
+    saved = key = None
+    if crack:
+        progress(0, 1, "Looking for saved cracked names...")
+        key = resolve_key(index, names, names_path, online, harvested_voice)
+        saved = load_saved_resolve(game, key)
+    if saved is not None:
+        result = restore_resolve(index, saved, folder, progress=progress, cancel=cancelled)
+    else:
+        result = resolve_all_matches(index, names, folder, export=export, online=online,
+                                     harvested_voice=harvested_voice, progress=progress, cancel=cancelled,
+                                     crack=crack)
+        if crack:
+            progress(0, 1, "Saving the cracked names...")
+            save_resolve(game, key, result, index)
     progress(0, 1, "Preparing the result list...")
-    return index, result, ResultModel(index, result.matches)
+    return ScanOutcome(index, result, ResultModel(index, result.matches), saved.saved_on() if saved else "")
 
 
 class MainWindow(QMainWindow):
@@ -87,7 +117,11 @@ class MainWindow(QMainWindow):
         volume = int(self.config.get("volume", _DEFAULT_VOLUME))
         self.player = Player(volume, self)
         self.player.state_changed.connect(self._on_playback_state)
-        self.player.ready.connect(self._play_after_download)
+        self.player.queue_changed.connect(self._on_queue_changed)
+        self.autoplay_timer = QTimer(self)
+        self.autoplay_timer.setSingleShot(True)
+        self.autoplay_timer.setInterval(_AUTOPLAY_DELAY_MS)
+        self.autoplay_timer.timeout.connect(self._autoplay)
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -119,6 +153,7 @@ class MainWindow(QMainWindow):
         self.game = game
         self.game_buttons[game].setChecked(True)
         self.harvest_box.value.setText("nothing harvested yet")
+        self.generate_tab.restore_saved(game)
         self.file_box.value.setText(Path(self.names_path).name or "no file loaded")
         self.file_box.check.setChecked(bool(self.names_path))
         self._sync_game_ui()
@@ -186,9 +221,12 @@ class MainWindow(QMainWindow):
         self.filter_edit.textChanged.connect(self.schedule_filter)
         search_row.addWidget(self.filter_edit, 1)
         right.addLayout(search_row)
-        self.tree = ResultsTree(self.config.get("column_widths_v3"))
-        self.tree.itemSelectionChanged.connect(self.update_buttons)
-        self.tree.itemDoubleClicked.connect(lambda *_args: self.play_selected())
+        self.tree = ResultsTree(self.config.get("column_widths_v4"))
+        self.tree.itemSelectionChanged.connect(self._on_selection_changed)
+        self.tree.itemDoubleClicked.connect(self._on_double_click)
+        self.tree.play_requested.connect(lambda: self.play_selected(restart=True))
+        self.tree.toggle_requested.connect(self.toggle_playback)
+        self.tree.step_requested.connect(self.player.step)
         self.tree.customContextMenuRequested.connect(self.on_tree_menu)
         copy_action = QAction("Copy IDs", self.tree)
         copy_action.setShortcut(QKeySequence.StandardKey.Copy)
@@ -207,7 +245,8 @@ class MainWindow(QMainWindow):
         self.icon_stop = media_icon("stop", color)
         self.play_button = QPushButton("Play")
         self.play_button.setIcon(self.icon_play)
-        self.play_button.clicked.connect(self.play_selected)
+        self.play_button.setToolTip(_PLAY_TOOLTIP)
+        self.play_button.clicked.connect(lambda: self.play_selected())
         self.play_button.setEnabled(False)
         row.addWidget(self.play_button)
         self.stop_button = QPushButton("Stop")
@@ -215,6 +254,26 @@ class MainWindow(QMainWindow):
         self.stop_button.clicked.connect(self.player.stop)
         self.stop_button.setEnabled(False)
         row.addWidget(self.stop_button)
+        self.previous_button = QPushButton()
+        self.previous_button.setIcon(media_icon("previous", color))
+        self.previous_button.setToolTip("Previous wem of the event (Ctrl+Left)")
+        self.previous_button.clicked.connect(lambda: self.player.step(-1))
+        self.previous_button.setEnabled(False)
+        row.addWidget(self.previous_button)
+        self.next_button = QPushButton()
+        self.next_button.setIcon(media_icon("next", color))
+        self.next_button.setToolTip("Next wem of the event (Ctrl+Right)")
+        self.next_button.clicked.connect(lambda: self.player.step(1))
+        self.next_button.setEnabled(False)
+        row.addWidget(self.next_button)
+        self.queue_label = QLabel("")
+        row.addWidget(self.queue_label)
+        row.addSpacing(6)
+        self.autoplay_check = QCheckBox("Play on select")
+        self.autoplay_check.setToolTip(_AUTOPLAY_TOOLTIP)
+        self.autoplay_check.setChecked(bool(self.config.get("autoplay", False)))
+        row.addWidget(self.autoplay_check)
+        row.addSpacing(12)
         self.export_button = QPushButton("Export WEM...")
         self.export_button.setToolTip("Export the selected wems (ctrl/shift click selects more than one;\n"
                                       "selecting an event exports every wem it uses)")
@@ -339,7 +398,8 @@ class MainWindow(QMainWindow):
 
     def _on_harvested(self, result):
         self.harvest = result
-        self.harvest_box.value.setText(f"{len(result.names):,} names")
+        when = f" · {result.harvested}" if result.harvested else ""
+        self.harvest_box.value.setText(f"{len(result.names):,} names{when}")
         self.harvest_box.check.setChecked(bool(result.names))
 
     def _on_harvest_finished(self):
@@ -437,8 +497,9 @@ class MainWindow(QMainWindow):
         self.tree.clear()
         self.export_names_button.setEnabled(False)
         self.scan_button.setText("Cancel")
+        game = self.game
         task = Task(lambda progress, cancelled: _scan_and_resolve(
-            folder, names_path, extra_names, online, harvested_voice, crack, progress, cancelled))
+            game, folder, names_path, extra_names, online, harvested_voice, crack, progress, cancelled))
         task.progressed.connect(self.on_progress)
         task.succeeded.connect(lambda outcome: self._on_scan_done(task, outcome))
         task.failed.connect(lambda message: self._on_scan_stopped(task, message, failed=True))
@@ -460,12 +521,13 @@ class MainWindow(QMainWindow):
             return
         self.scan_button.setText("Scan")
         self.progress.setVisible(False)
-        self.index, result, self.model = outcome
+        self.index, result, self.model = outcome.index, outcome.result, outcome.model
         self.matches, self.unmatched = result.matches, result.unmatched
         stats = self.index.stats
+        restored = f" — cracked names restored from {outcome.restored}" if outcome.restored else ""
         self.status_label.setText(
             f"{stats['pck']:,} pck, {stats['objects']:,} objects, {stats['wem_ids']:,} wems — "
-            f"matches: {len(self.matches):,}, unmatched: {len(self.unmatched):,}")
+            f"matches: {len(self.matches):,}, unmatched: {len(self.unmatched):,}{restored}")
         self.export_names_button.setEnabled(bool(self.matches))
         self.rail.refresh(self.model)
         self.apply_filter()
@@ -485,15 +547,44 @@ class MainWindow(QMainWindow):
         if len(selection.rows) != len(self.model.rows):
             self.status_label.setText(f"{len(selection.rows):,} of {len(self.model.rows):,} results shown")
 
-    def play_selected(self):
+    # Play toggles pause on the sound already playing, and Enter or a double click start it over.
+    def play_selected(self, restart=False):
         started = time.time() if os.environ.get("HSI_TIMING") else None
-        self.player.play(self.tree.selected_location())
+        queue, position = self.tree.playback_queue(self.tree.playback_item())
+        if position < 0 or (not restart and self.player.is_current(queue[position][1])):
+            self.player.toggle()
+        else:
+            self.player.play(queue, position)
         if started is not None:
             print(f"[timing] play_selected (GUI thread): {time.time() - started:.3f}s", flush=True)
 
-    def _play_after_download(self):
-        if self.tree.selected_location() is not None:
+    def toggle_playback(self):
+        if not self.player.toggle():
             self.play_selected()
+
+    # A node without audio of its own, like a character's action, folds and unfolds instead.
+    def _on_double_click(self, item, _column):
+        if self.tree.is_playable(item):
+            self.play_selected(restart=True)
+        else:
+            item.setExpanded(not item.isExpanded())
+
+    def _on_selection_changed(self):
+        self.update_buttons()
+        if self.autoplay_check.isChecked():
+            self.autoplay_timer.start()
+
+    def _autoplay(self):
+        queue, position = self.tree.playback_queue(self.tree.playback_item())
+        if position >= 0 and not self.player.is_current(queue[position][1]):
+            self.player.play(queue, position)
+
+    def _on_queue_changed(self):
+        player = self.player
+        count = len(player.queue)
+        self.queue_label.setText(f"{player.position + 1} / {count}" if count > 1 else "")
+        self.previous_button.setEnabled(player.position > 0)
+        self.next_button.setEnabled(0 <= player.position < count - 1)
 
     def _on_playback_state(self):
         if self.player.is_playing():
@@ -510,7 +601,8 @@ class MainWindow(QMainWindow):
 
     def update_buttons(self):
         count = self.tree.selected_export_count()
-        self.play_button.setEnabled(self.tree.selected_location() is not None or not self.player.is_stopped())
+        playable = self.tree.is_playable(self.tree.playback_item())
+        self.play_button.setEnabled(playable or not self.player.is_stopped())
         self.export_button.setEnabled(count > 0 and not running(self.export_task))
         self.export_button.setText("Export WEM..." if count < 2 else f"Export {count:,} WEM...")
         self.copy_button.setEnabled(bool(self.tree.selectedItems()))
@@ -633,8 +725,8 @@ class MainWindow(QMainWindow):
         count = self.tree.selected_export_count()
         menu = QMenu(self)
         play = menu.addAction("Play")
-        play.setEnabled(self.tree.selected_location() is not None)
-        play.triggered.connect(self.play_selected)
+        play.setEnabled(self.tree.is_playable(self.tree.playback_item()))
+        play.triggered.connect(lambda: self.play_selected(restart=True))
         export = menu.addAction("Export WEM..." if count < 2 else f"Export {count:,} WEM...")
         export.setEnabled(self.export_button.isEnabled())
         export.triggered.connect(self.export_selected)
@@ -662,9 +754,10 @@ class MainWindow(QMainWindow):
         folders = dict(self.config.get("folders") or {})
         if folder:
             folders[self.game] = folder
-        self.config.update({"column_widths_v3": self.tree.column_widths(), "game": self.game,
+        self.config.update({"column_widths_v4": self.tree.column_widths(), "game": self.game,
                             "folder": folder, "folders": folders, "names": self.names_path,
-                            "crack": self.crack_check.isChecked()})
+                            "crack": self.crack_check.isChecked(),
+                            "autoplay": self.autoplay_check.isChecked()})
         save_config(self.config)
         for task in (self.scan_task, self.export_task, self.generate_tab.task):
             if running(task):

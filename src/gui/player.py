@@ -16,11 +16,11 @@ _VOLUME_SLIDER_WIDTH = 110
 _VOLUME_LABEL_WIDTH = 34
 
 
+# The queue holds (wem id, location) pairs, the wems of one event, which previous and next walk through.
 class Player(QObject):
     message = pyqtSignal(str)
     state_changed = pyqtSignal()
-    # vgmstream was just downloaded, so the window plays whatever is selected by now.
-    ready = pyqtSignal()
+    queue_changed = pyqtSignal()
 
     def __init__(self, volume, parent=None):
         super().__init__(parent)
@@ -33,8 +33,10 @@ class Player(QObject):
         self.temp_dir = None
         # However the application ends, the converted files go.
         QCoreApplication.instance().aboutToQuit.connect(self.shutdown)
+        self.queue = []
+        self.position = -1
+        self._requested = None
         self._loaded = None
-        self._pending = None
         self._sequence = 0
         self._convert_task = None
         self._download_task = None
@@ -45,40 +47,71 @@ class Player(QObject):
     def is_stopped(self):
         return self.media.playbackState() == QMediaPlayer.PlaybackState.StoppedState
 
-    # With nothing new to load it toggles pause, and without vgmstream it downloads it first.
-    def play(self, location):
+    # Playing or paused on that copy, or converting it.
+    def is_current(self, location):
+        return location is self._requested and (location is not self._loaded or not self.is_stopped())
+
+    def play(self, queue, position):
+        self.queue, self.position = queue, position
+        self.queue_changed.emit()
+        self._load(queue[position][1])
+
+    def step(self, delta):
+        position = self.position + delta
+        if 0 <= position < len(self.queue):
+            self.play(self.queue, position)
+
+    # False with nothing loaded, so the caller can play the selection instead.
+    def toggle(self):
+        if self._loaded is None:
+            return False
+        if self.is_playing():
+            self.media.pause()
+        else:
+            self.media.play()
+        return True
+
+    # A copy already converted starts over, and of several conversions only the latest request plays.
+    def _load(self, location):
+        self._requested = location
+        self._sequence += 1
+        sequence = self._sequence
         if not self.vgmstream:
             self._download_vgmstream()
             return
-        if (location is None or location is self._loaded) and not self.is_stopped():
-            if self.is_playing():
-                self.media.pause()
-            else:
-                self.media.play()
-            return
-        if location is None or running(self._convert_task):
+        if location is self._loaded:
+            self.message.emit("")
+            self.media.setPosition(0)
+            self.media.play()
             return
         self.media.stop()
         self.media.setSource(QUrl())
+        self._loaded = None
         self.message.emit("Converting...")
-        self._pending = location
-        self._sequence += 1
-        stem = f"hsi_{self._sequence}"
         if self.temp_dir is None:
             self.temp_dir = tempfile.mkdtemp(prefix="hoyosoundindexer_")
         out_dir = self.temp_dir
-        self._convert_task = Task(
-            lambda _progress, _cancelled: wem_to_wav(extract_wem_bytes(location), self.vgmstream,
-                                                     out_dir, stem))
-        self._convert_task.succeeded.connect(self._on_wav_ready)
-        self._convert_task.failed.connect(lambda error: self.message.emit(f"Error: {error}"))
-        self._convert_task.start()
+        vgmstream = self.vgmstream
+        task = Task(lambda _progress, _cancelled: wem_to_wav(extract_wem_bytes(location), vgmstream, out_dir,
+                                                             f"hsi_{sequence}"))
+        task.succeeded.connect(lambda wav_path: self._on_wav_ready(sequence, location, wav_path))
+        task.failed.connect(lambda error: self._on_wav_failed(sequence, error))
+        # Held until the next conversion, or the finished task could be collected before its result arrives.
+        self._convert_task = task.start()
 
-    def _on_wav_ready(self, wav_path):
+    def _on_wav_ready(self, sequence, location, wav_path):
+        if sequence != self._sequence:
+            return
         self.message.emit("")
-        self._loaded = self._pending
+        self._loaded = location
         self.media.setSource(QUrl.fromLocalFile(wav_path))
         self.media.play()
+
+    # The failed copy is no longer current, so Play tries it again.
+    def _on_wav_failed(self, sequence, error):
+        if sequence == self._sequence:
+            self._requested = None
+            self.message.emit(f"Error: {error}")
 
     def stop(self):
         self.media.stop()
@@ -97,10 +130,12 @@ class Player(QObject):
             lambda error: self.message.emit(f"vgmstream download failed: {error}"))
         self._download_task.start()
 
+    # The wem asked for while downloading plays as soon as vgmstream is there.
     def _on_vgmstream_ready(self, path):
         self.vgmstream = path
         self.message.emit("")
-        self.ready.emit()
+        if self._requested is not None:
+            self._load(self._requested)
 
     # Safe to call twice, since both the window's close and the application's quit call it.
     def shutdown(self):

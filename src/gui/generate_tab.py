@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
 
 from src.config import APP_NAME, save_config
 from src.games import blocks_folder
-from src.harvest import default_harvest_prefixes, harvest_folder
+from src.harvest import default_harvest_prefixes, harvest_folder, load_saved_harvest, save_harvest
 from src.online.sources import source_for
 from src.vocabulary import DEFAULT_HARVEST_PREFIXES, HARVEST_PREFIXES_BY_GAME
 from src.gui.tasks import Task, running
@@ -76,7 +76,8 @@ class GenerateTab(QWidget):
         self.save_voice_button.setEnabled(False)
         row.addWidget(self.save_voice_button)
         row.addStretch(1)
-        hint = QLabel("Harvested names feed Scan through the \"Client harvest\" box in the Search tab.")
+        hint = QLabel("Harvested names feed Scan through the \"Client harvest\" box in the Search tab, "
+                      "and are kept for the next start.")
         hint.setStyleSheet("color: gray")
         row.addWidget(hint)
         layout.addLayout(row)
@@ -94,6 +95,14 @@ class GenerateTab(QWidget):
         if self.prefixes_edit.text().strip() in defaults:
             self.prefixes_edit.setText(default_harvest_prefixes(game))
         self.blocks_auto = True
+        self.restore_saved(game)
+
+    # The game's last harvest comes back from the cache as if it had just run.
+    def restore_saved(self, game):
+        result = load_saved_harvest(game)
+        if result is not None:
+            self._show(result)
+            self.harvested.emit(result)
 
     def follow_install(self, install_root, game):
         if not self.blocks_auto or not install_root:
@@ -128,8 +137,8 @@ class GenerateTab(QWidget):
         self.config.update({"harvest_folder": folder, "prefixes": self.prefixes_edit.text(), "game": game})
         save_config(self.config)
         self.harvest_button.setText("Cancel")
-        task = Task(lambda progress, cancelled: harvest_folder(folder, prefixes, progress=progress,
-                                                               cancel=cancelled, game=game))
+        task = Task(lambda progress, cancelled: _harvest_and_save(folder, prefixes, game, progress,
+                                                                  cancelled))
         task.progressed.connect(self.progressed)
         task.succeeded.connect(lambda result: self._on_done(task, result))
         task.failed.connect(lambda message: self._on_stopped(task, message))
@@ -141,18 +150,23 @@ class GenerateTab(QWidget):
             return
         self.harvest_button.setText("Harvest")
         self.finished.emit()
-        self.result = result
         names, voice = result.names, result.voice
         self.status.emit(f"{len(names)} candidate names harvested"
                          + (f", {len(voice.sources)} voice names" if voice.sources else ""))
-        self.names_header.setText(f"Harvested event names — {len(names):,}")
+        self._show(result)
+        self.harvested.emit(result)
+
+    def _show(self, result):
+        self.result = result
+        names, voice = result.names, result.voice
+        when = f" · {result.harvested}" if result.harvested else ""
+        self.names_header.setText(f"Harvested event names — {len(names):,}{when}")
         self.voice_header.setText(f"Harvested voice data — {len(voice.sources):,}")
         self.save_names_button.setEnabled(bool(names))
         self.save_voice_button.setEnabled(bool(voice.sources))
         more = len(names) - _PREVIEW_NAMES
         self.names_preview.setPlainText("\n".join(names[:_PREVIEW_NAMES]) + (f"\n... {more} more" if more > 0 else ""))
         self.voice_preview.setPlainText("\n".join(self._voice_preview_lines(voice)))
-        self.harvested.emit(result)
 
     # A cancelled or failed harvest keeps the previous result.
     def _on_stopped(self, task, message):
@@ -202,6 +216,14 @@ class GenerateTab(QWidget):
             self.status.emit(f"Saved voice data to {Path(out).name}")
         except Exception as e:
             QMessageBox.warning(self, APP_NAME, f"Save failed: {e}")
+
+
+# A cancelled harvest is not saved, so the cache keeps the last complete one.
+def _harvest_and_save(folder, prefixes, game, progress, cancelled):
+    result = harvest_folder(folder, prefixes, progress=progress, cancel=cancelled, game=game)
+    if not result.cancelled:
+        save_harvest(game, folder, result)
+    return result
 
 
 def _form_label(text):
