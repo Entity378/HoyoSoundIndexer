@@ -33,7 +33,7 @@ def _decompress(block, out_size, kind):
         return _lzma_decompress(bytes(block), out_size)
     if kind in (_C_OODLE, _C_OODLE_HSR):
         return oodle_decompress(bytes(block), out_size)
-    raise ValueError("compressione UnityFS non supportata: %d" % kind)
+    raise ValueError("unsupported UnityFS compression: %d" % kind)
 
 
 def _read_cstring(data, pos):

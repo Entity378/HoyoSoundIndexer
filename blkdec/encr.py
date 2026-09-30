@@ -23,7 +23,7 @@ def _decompress(block, out_size, kind):
         return oodle_decompress(bytes(block), out_size)
     if kind == _C_NONE:
         return bytes(block[:out_size])
-    raise ValueError("compressione ENCR non supportata: %d" % kind)
+    raise ValueError("unsupported ENCR compression: %d" % kind)
 
 
 def _iter_one_encr(data, base):

@@ -1,11 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 a = Analysis(
-    ['hoyo_sound_indexer.py'],
+    ['HoyoSoundIndexer.py'],
     pathex=[],
     binaries=[],
     datas=[('blkdec/AnimeStudio.Ooz.dll', 'blkdec')],
-    hiddenimports=['blkdec', 'blkdec.mhy', 'blkdec.blb', 'blkdec.encr', 'blkdec.unityfs', 'blkdec._keys', 'certifi'],
+    hiddenimports=['src.gui.app', 'blkdec', 'blkdec.mhy', 'blkdec.blb', 'blkdec.encr', 'blkdec.unityfs', 'blkdec._keys', 'certifi'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

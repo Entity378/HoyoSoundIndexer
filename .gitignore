@@ -9,3 +9,6 @@ old/
 *_event_names.json
 *_harvested_names.txt
 README.local.txt
+
+# unit tests stay local, out of the repo
+tests/
