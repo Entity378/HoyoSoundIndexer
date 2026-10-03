@@ -76,9 +76,6 @@ def blocks_folder(install_root, game):
     return candidate if candidate.is_dir() else None
 
 
-PERSISTENT_PRIORITY_PCKS = {"patch.pck", "hotfix.pck"}
-
-
 # Downloaded and hotfix content lands in the Persistent twin of a StreamingAssets folder.
 def persistent_twins(root):
     parts = list(Path(root).parts)
@@ -91,7 +88,8 @@ def persistent_twins(root):
     return []
 
 
-# A pck found in both roots is read from Persistent only for Patch and Hotfix.
+# A pck found in both roots is read from Persistent, where the launcher writes the patched copy.
+# HSR 4.6 keeps 167 such pairs, whose StreamingAssets copies date from the install and miss the new voices.
 def dedupe_pck_files(paths):
     groups = {}
     for path in paths:
@@ -105,10 +103,8 @@ def dedupe_pck_files(paths):
     kept, dropped = [], 0
     for candidates in groups.values():
         if len(candidates) > 1:
-            name = candidates[0][1].name.lower()
-            preferred = "persistent" if name in PERSISTENT_PRIORITY_PCKS else "streamingassets"
-            chosen = [path for marker, path in candidates if marker == preferred]
-            kept.append((chosen or [path for _marker, path in candidates])[0])
+            patched = [path for marker, path in candidates if marker == "persistent"]
+            kept.append((patched or [path for _marker, path in candidates])[0])
             dropped += len(candidates) - 1
         else:
             kept.append(candidates[0][1])
