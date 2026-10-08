@@ -33,21 +33,23 @@ KNOWN_SYNC_NAMES = ("vo_charconfirm", "vo_charconfirm_yes", "vo_charconfirm_no",
                     "state_battle_speed", "normal_speed", "double_speed", "none")
 
 
-# Event families whose slot names the character, matched on lowercase names.
-CHARACTER_EVENT_PATTERNS = (
+# ZZZ event families with a character slot, matched on lowercase names: play_vo_char_<agent>_<action>.
+CHARACTER_SLOT_PATTERNS = (
     re.compile(r"^play_vo_char_([a-z0-9]+)_"),
     re.compile(r"^play_sfx_char_(?:foley|skill|impact)_([a-z0-9]+)_"),
 )
 # The synthetic tag group carrying the character, which the bank tells rather than a game sync.
 CHARACTER_GROUP_NAME = "Character"
-# An event playing a voice line, whatever verb comes first: play_vo_, vo_, HSR's ev_vo_.
-VO_EVENT_PATTERN = re.compile(r"^(?:play_|stop_|ev_)?vo_")
 # A voice path spells its category and its speaker as Vo_ folders, the first and the last.
 SPEAKER_FOLDER_PREFIX = "vo_"
+# An event playing a voice line has vo among its words: play_vo_, HSR's ev_archive_vo_, GI's Play_Beyd_vo_.
+VO_EVENT_PATTERN = re.compile(r"(?:^|_)vo(?:_|$)")
+# Words an event name opens with before its family, as in Play_Sfx_ and HSR's Ev_vo_.
+EVENT_VERB_WORDS = ("play", "ev", "stop", "set", "mute", "pause", "resume")
 
-# Combat VO actions in suffix form and in game order, labelled like the community wiki.
-# None means the game has the action but nobody has named it yet.
-COMBAT_ACTIONS = (
+# Combat voice actions in game order, labelled like each game's wiki; None means nobody has named one yet.
+# ZZZ keys are the suffix of the character slot, play_vo_char_<agent>_<key>.
+ZZZ_VO_ACTIONS = (
     ("attacklight", "Basic Attack"),
     ("attackcharge", "Basic Attack (Charged)"),
     ("attackenhance", "Basic Attack (Enhanced)"),
@@ -94,6 +96,66 @@ COMBAT_ACTIONS = (
     ("taunt", None),
     ("charselect", "Character Select"),
     ("charconfirm", "Character Confirm"),
+)
+# HSR voice events are a head, the action, then the avatar, as in ev_vo_avatar_turn_begin_kafka.
+# The archive head is the profile copy of the same line, with its own wems.
+HSR_VO_HEADS = ("ev_vo_avatar_", "ev_archive_vo_avatar_")
+HSR_VO_ACTIONS = (
+    ("advantage", "Battle Begins: Weakness Break"),
+    ("high_threat", "Battle Begins: Danger Alert"),
+    ("turn_begin", "Turn Begins"),
+    ("waiting", "Turn Idling"),
+    ("atk_cast", "Basic ATK"),
+    ("skill_cast", "Skill"),
+    ("hit_light", "Hit by Light Attack"),
+    ("hit_heavy", "Hit by Heavy Attack"),
+    ("ultra_skill_select", "Ultimate: Activate"),
+    ("ultra_skill_cast", "Ultimate: Unleash"),
+    ("passive_skill", "Talent"),
+    ("die", "Downed"),
+    ("revive", "Return to Battle"),
+    ("healing", "Health Recovery"),
+    ("atk_maze", "Overworld Basic ATK"),
+    ("skill_maze", "Technique"),
+    ("battle_victory_maze", "Battle Won"),
+    ("open_chest_maze", "Treasure Opening"),
+    ("open_preciouschest_maze", "Precious Treasure Opening"),
+    ("solve_puzzle_maze", "Successful Puzzle-Solving"),
+    ("lookat_threat_maze", "Enemy Target Found"),
+    ("town_teleport_maze", "Returning to Town"),
+    ("idleshow_maze", "Character Idles"),
+    ("addtoteam", "Added to Team"),
+    ("growth_eidolon_unlock", "Eidolon Activation"),
+    ("growth_ascension_unlock", "Character Ascension"),
+    ("growth_maxlevel_unlock", "Max Level Reached"),
+    ("growth_trace_unlock", "Trace Activation"),
+)
+# GI keys are the middle of the VO_gameplay file names, vo_<speaker>_<key>_<take>.
+GI_VO_ACTIONS = (
+    ("battle_attacklight", "Light Attack"),
+    ("battle_attackmid", "Mid Attack"),
+    ("battle_attackheavy", "Heavy Attack"),
+    ("battle_attack_attackplunging", "Plunging Attack"),
+    ("battle_skill1", "Elemental Skill"),
+    ("battle_skill2", None),
+    ("battle_skill3", "Elemental Burst"),
+    ("explore_sprint_start", "Sprint Start"),
+    ("explore_sprint_end", "Sprint End"),
+    ("explore_fly_start", "Deploying Wind Glider"),
+    ("explore_fly_end", "Disengaging Wind Glider"),
+    ("chest_open", "Opening Treasure Chest"),
+    ("life_less30", "Low HP"),
+    ("life_less30_teammate", "Ally at Low HP"),
+    ("life_die", "Fallen"),
+    ("battle_hit_l", "Light Hit Taken"),
+    ("battle_hit_h", "Heavy Hit Taken"),
+    ("teamjoin", "Joining Party"),
+    ("explore_idle", "Character Idles"),
+    ("standbyshow", "Character Idles (Standby)"),
+    ("explore_climb", "Climbing"),
+    ("explore_climb_breath", "Climbing Breath"),
+    ("explore_jump", "Jumping"),
+    ("explore_superjump", "Superjump"),
 )
 
 # Comma separated, as the CLI takes them.

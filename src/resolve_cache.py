@@ -40,7 +40,7 @@ def resolve_key(index, names, names_file, online, harvested_voice):
         _feed(digest, "voice paths", online.voice_paths)
         _feed(digest, "labels", [f"{oid}={name}" for oid, name in sorted(online.id_names.items())])
         _feed(digest, "state candidates", online.state_candidates)
-        _feed(digest, "roster", [f"{code}={name}" for code, name in sorted(online.avatar_names.items())])
+        _feed(digest, "roster", [f"{code}={name}" for code, name in sorted(online.roster.items())])
     if harvested_voice is not None:
         _feed(digest, "voice prefixes", harvested_voice.prefixes)
         _feed(digest, "voice sources", harvested_voice.sources)
@@ -76,7 +76,8 @@ def save_resolve(game, key, result, index):
         "format": _FORMAT,
         "key": key,
         "saved": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "avatar_names": dict(sorted(index.avatar_names.items())),
+        "avatar_names": dict(sorted(index.character_names.items())),
+        "avatar_codes": dict(sorted(index.avatar_codenames.items())),
         "unmatched": list(result.unmatched),
         "rows": [[m.name, m.kind, m.hash_id] for m in result.matches],
     })

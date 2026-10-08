@@ -3,7 +3,8 @@
 
 from typing import NamedTuple
 
-from src.characters import label_characters
+from src.characters import label_characters, slot_codenames
+from src.cracking.avatars import crack_avatar_events
 from src.cracking.context import crack_context_names
 from src.cracking.families import crack_event_families
 from src.cracking.syncs import crack_sync_names
@@ -69,10 +70,20 @@ def resolve_all_matches(index, names, scan_root, export=None, online=None, harve
         matches.extend(labels)
         counts["labels"] = len(labels)
 
+    # The online roster lists the avatars; without it an export brings back the names it saved.
+    roster = online.roster if online is not None else {}
+    saved_names = export.character_names() if export is not None and not roster else {}
+    saved_codenames = export.avatar_codenames() if export is not None and not roster else {}
+
     if crack:
         family_matches = crack_event_families(index, matches, progress=progress, candidates=state_names)
         matches.extend(family_matches)
         counts["family_events"] = len(family_matches)
+        _check(cancel)
+        codenames = set(roster or saved_codenames) | set(slot_codenames(matches))
+        avatar_matches = crack_avatar_events(index, matches, codenames, progress=progress)
+        matches.extend(avatar_matches)
+        counts["avatar_events"] = len(avatar_matches)
         _check(cancel)
         if progress:
             progress(0, 1, "Cracking tags from context...")
@@ -85,10 +96,7 @@ def resolve_all_matches(index, names, scan_root, export=None, online=None, harve
     matches.extend(branches)
     counts["music_branches"] = len(branches)
 
-    # The online roster lists avatars; an export's is exact on its own data and no ground to guess from.
-    online_roster = online.avatar_names if online is not None else {}
-    avatar_names = online_roster or (export.avatar_names() if export is not None else {})
-    matches.extend(label_characters(index, matches, avatar_names, by_prefix=bool(online_roster)))
+    matches.extend(label_characters(index, matches, roster, saved_names, saved_codenames))
     counts["characters"] = len(index.wem_characters)
 
     attach_sync_wems(index, matches)

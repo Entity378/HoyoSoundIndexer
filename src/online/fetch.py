@@ -181,7 +181,7 @@ def fetch_zzz_music(source, progress=None):
     return sorted(names), id_names, avatar_roster(rows, titles)
 
 
-def fetch_avatar_names(source, progress=None):
+def fetch_avatar_roster(source, progress=None):
     rows = avatar_rows(source, progress)
     if not rows:
         return {}

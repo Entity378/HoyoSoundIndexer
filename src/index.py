@@ -42,7 +42,12 @@ class ScanIndex:
         self.wem_characters = {}
         self.character_banks = {}
         # Every spelling of a character met by the resolve -> the name shown for it.
-        self.avatar_names = {}
+        self.character_names = {}
+        # The words naming an avatar -> its shown name, in event names, in voice paths and as a voice file's speaker.
+        # Voice paths say sunna where the events say summer, and Xianyun's NPC lines say liuyun.
+        self.avatar_codenames = {}
+        self.avatar_voice_names = {}
+        self.avatar_file_speakers = {}
         # Wem id -> milliseconds, filled by read_durations for the GUI.
         self.wem_durations = {}
 

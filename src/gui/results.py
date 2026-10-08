@@ -5,7 +5,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 from src.characters import (
-    CHARACTER_GROUP_ID, action_of_match, character_of_match, normalize_character,
+    CHARACTER_GROUP_ID, action_of_match, characters_of_match, normalize_character,
 )
 from src.model import Kind, NameMatch
 from src.vocabulary import VO_EVENT_PATTERN
@@ -34,7 +34,7 @@ def bucket_of_kind(kind):
 
 
 def bucket_of_match(m):
-    if m.kind in Kind.EVENTS and VO_EVENT_PATTERN.match(m.name.lower()):
+    if m.kind in Kind.EVENTS and VO_EVENT_PATTERN.search(m.name.lower()):
         return "vo"
     return bucket_of_kind(m.kind)
 
@@ -143,7 +143,7 @@ class ResultRow:
     name_lower: str
     bucket: str
     language: str
-    character: str = ""
+    characters: tuple = ()
     action: str = ""
     tag_text: str = ""
     tag_search: str = ""
@@ -175,7 +175,7 @@ class ResultModel:
         self.index = index
         self.matches = matches
         self.tags = TagRenderer(index, matches)
-        self.aliases = dict(index.avatar_names)
+        self.character_names = dict(index.character_names)
         self.wem_sizes = _biggest_sizes(index)
         self.rows = [self._row(m) for m in matches]
         # The rows of each bucket and character in list order, so a filter on either walks only those.
@@ -183,18 +183,18 @@ class ResultModel:
         self.rows_by_character = defaultdict(list)
         for row in self.rows:
             self.rows_by_bucket[row.bucket].append(row)
-            if row.character:
-                self.rows_by_character[row.character].append(row)
+            for name in row.characters:
+                self.rows_by_character[name].append(row)
         self.character_wems = defaultdict(set)
         for wem_id, owner in index.wem_characters.items():
-            self.character_wems[self.aliases.get(owner.lower(), owner)].add(wem_id)
+            self.character_wems[self.character_names.get(owner.lower(), owner)].add(wem_id)
         self._build_id_lookup()
 
     def _row(self, m):
         tags = self.tags.tags_of_match(m)
         return ResultRow(match=m, name_lower=m.name.lower(), bucket=bucket_of_match(m),
                          language=language_of_match(m),
-                         character=character_of_match(self.index, m, self.aliases),
+                         characters=characters_of_match(self.index, m),
                          action=action_of_match(m), tag_text=self.tags.match_text(m, tags),
                          tag_search=self.tags.search_text(tags), size=self.size_of(m.wem_ids),
                          duration=self.duration_of(m.wem_ids))
@@ -231,7 +231,7 @@ class ResultModel:
             match = row.match
             if bucket != "all" and row.bucket != bucket:
                 continue
-            if character and row.character != character:
+            if character and character not in row.characters:
                 continue
             if row.language and row.language not in languages:
                 continue
@@ -272,14 +272,18 @@ class ResultModel:
     def language_counts(self):
         return Counter(row.language for row in self.rows if row.language)
 
+    # A row naming two characters counts for both, and once in the total.
     def character_counts(self):
-        return Counter(row.character for row in self.rows if row.character)
+        return Counter(name for row in self.rows for name in row.characters)
+
+    def character_row_total(self):
+        return sum(1 for row in self.rows if row.characters)
 
     # Other names skip longer forms (normahollowell for Norma) but keep real ones (zhenzhen for Ye Shunguang).
     # The search text holds every spelling, so heizo finds Shikanoin Heizou.
     def character_spellings(self):
         others, spellings = defaultdict(set), defaultdict(set)
-        for code, display in self.aliases.items():
+        for code, display in {**self.index.avatar_codenames, **self.character_names}.items():
             spellings[display].add(code)
             canonical = normalize_character(display)
             if code != canonical and canonical not in code:

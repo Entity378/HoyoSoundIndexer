@@ -409,7 +409,7 @@ class MainWindow(QMainWindow):
     # An old cache has no roster, and saying so is how the user knows to press Update.
     def _online_summary(self):
         data = self.online
-        avatars = len(data.avatar_names)
+        avatars = len(data.roster)
         note = f" · {avatars:,} avatar names" if avatars else " · no avatar names (Update)"
         return f"{len(data.voice_paths):,} voice · {len(data.id_names):,} labels" + note
 

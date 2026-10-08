@@ -141,7 +141,7 @@ class FilterRail(QFrame):
         if not counts:
             return
         others, self._character_texts = model.character_spellings()
-        rows = [("", "All", sum(counts.values()))]
+        rows = [("", "All", model.character_row_total())]
         for name, total in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
             alias = ", ".join(sorted(others.get(name, ())))
             rows.append((name, f"{name} ({alias})" if alias else name, total))

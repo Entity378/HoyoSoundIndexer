@@ -4,13 +4,13 @@ from datetime import datetime
 
 from src.config import online_cache_file
 from src.online.fetch import (
-    fetch_audio_labels, fetch_avatar_names, fetch_event_names, fetch_state_candidates,
+    fetch_audio_labels, fetch_avatar_roster, fetch_event_names, fetch_state_candidates,
     fetch_voice_paths, fetch_zzz_music,
 )
 from src.online.sources import source_for
 
 
-# Old caches lack state_candidates and avatar_names until the next Update.
+# Old caches lack state_candidates and the roster until the next Update.
 @dataclass
 class OnlineData:
     game: str
@@ -20,7 +20,7 @@ class OnlineData:
     names: list = field(default_factory=list)
     id_names: dict = field(default_factory=dict)
     state_candidates: list = field(default_factory=list)
-    avatar_names: dict = field(default_factory=dict)
+    roster: dict = field(default_factory=dict)
 
     @classmethod
     def from_meta(cls, game, meta):
@@ -31,15 +31,15 @@ class OnlineData:
                    names=meta.get("names", []),
                    id_names=meta.get("id_names", {}),
                    state_candidates=meta.get("state_candidates", []),
-                   avatar_names=meta.get("avatar_names", {}))
+                   roster=meta.get("avatar_names", {}))
 
     def to_meta(self):
         return {"game": self.game, "label": self.label, "updated": self.updated,
                 "voice_count": len(self.voice_paths), "names_count": len(self.names),
                 "labels_count": len(self.id_names), "candidates_count": len(self.state_candidates),
-                "avatar_count": len(self.avatar_names),
+                "avatar_count": len(self.roster),
                 "voice_paths": self.voice_paths, "names": self.names, "id_names": self.id_names,
-                "state_candidates": self.state_candidates, "avatar_names": self.avatar_names}
+                "state_candidates": self.state_candidates, "avatar_names": self.roster}
 
 
 def has_online_cache(game):
@@ -74,9 +74,9 @@ def load_online_data(game, config=None, force=False, progress=None):
 
 def download_online_data(game, source, progress=None):
     voice_paths = sorted(set(fetch_voice_paths(game, source, progress)))
-    names, id_names, avatar_names = set(), {}, {}
+    names, id_names, roster = set(), {}, {}
     if source.get("music_cfg"):
-        music_names, music_ids, avatar_names = fetch_zzz_music(source, progress)
+        music_names, music_ids, roster = fetch_zzz_music(source, progress)
         names.update(music_names)
         id_names.update(music_ids)
     if source.get("audio_subtree"):
@@ -88,11 +88,11 @@ def download_online_data(game, source, progress=None):
     # A moved table or a missing text map costs the roster only, never the rest of the update.
     if source.get("avatar_textmap"):
         try:
-            avatar_names = fetch_avatar_names(source, progress)
+            roster = fetch_avatar_roster(source, progress)
         except Exception:
-            avatar_names = {}
+            roster = {}
     state_candidates = fetch_state_candidates(source, progress)
     return OnlineData(game=game, label=source.get("label", ""),
                       updated=datetime.now().strftime("%Y-%m-%d %H:%M"),
                       voice_paths=voice_paths, names=sorted(names), id_names=id_names,
-                      state_candidates=state_candidates, avatar_names=avatar_names)
+                      state_candidates=state_candidates, roster=roster)

@@ -78,11 +78,18 @@ class ExportedNames:
                 restored.append(NameMatch(name, kind, wems, oid))
         return restored
 
-    def avatar_names(self):
-        roster = self.doc.get("avatar_names")
+    def character_names(self):
+        return self._names_map("avatar_names")
+
+    # An older file has none, and its rows then find a character only by speaker or event slot.
+    def avatar_codenames(self):
+        return self._names_map("avatar_codes")
+
+    def _names_map(self, key):
+        roster = self.doc.get(key)
         if not isinstance(roster, dict):
             return {}
-        return {key: value for key, value in roster.items() if isinstance(value, str)}
+        return {code: value for code, value in roster.items() if isinstance(value, str)}
 
 
 # None when the index does not know the id, so an older export restores what still exists.
@@ -151,7 +158,8 @@ def export_json(matches, unmatched, index, scan_root, names_file, out_path):
         "direct_wems": direct_wems,
         "externals": externals,
         "game_syncs": game_syncs,
-        "avatar_names": dict(sorted(index.avatar_names.items())),
+        "avatar_names": dict(sorted(index.character_names.items())),
+        "avatar_codes": dict(sorted(index.avatar_codenames.items())),
         "wems": {str(wem_id): _wem_entry(index, wem_id, scan_root) for wem_id in sorted(used_wems)},
         "unmatched_names": unmatched,
     }
